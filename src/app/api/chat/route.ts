@@ -27,7 +27,7 @@ interface TaskItem {
 }
 
 interface ParsedIntent {
-  type: 'find_replace' | 'website_update' | 'social_post' | 'verify' | 'question' | 'multi_task' | 'unknown'
+  type: 'find_replace' | 'website_update' | 'social_post' | 'verify' | 'review' | 'question' | 'multi_task' | 'unknown'
   findText?: string
   replaceText?: string
   verifyText?: string
@@ -44,8 +44,13 @@ Your capabilities:
 1. **Find & Replace**: Update text across the website (e.g., "change ages 2 to ages 3")
 2. **Website Updates**: Create or modify website content sections
 3. **Social Posts**: Generate social media content for Facebook and Instagram
-4. **Verify Changes**: Check if text appears on the live website
-5. **Answer Questions**: Help with general questions
+4. **Verify Changes**: Check if SPECIFIC text appears on the live website (e.g., "verify ages 3 is on the site")
+5. **Review Website**: Fetch and analyze the ENTIRE website content to see what's currently there (e.g., "review the website", "what's on the site", "show me the current content")
+6. **Answer Questions**: Help with general questions
+
+IMPORTANT DISTINCTION between verify and review:
+- **verify**: Search for SPECIFIC text on the website (requires verifyText)
+- **review**: Get a full analysis of ALL content currently on the website (no specific text needed)
 
 IMPORTANT: When a user sends a message with MULTIPLE requests or tasks (like an email with several items), you MUST:
 1. Identify ALL the individual tasks/requests
@@ -70,10 +75,10 @@ Task status meanings:
 
 For SINGLE requests, use the standard format:
 {
-  "type": "find_replace" | "website_update" | "social_post" | "verify" | "question",
+  "type": "find_replace" | "website_update" | "social_post" | "verify" | "review" | "question",
   "findText": "text to find (for find_replace)",
   "replaceText": "replacement text (for find_replace)",
-  "verifyText": "text to verify (for verify)",
+  "verifyText": "text to verify (for verify - NOT needed for review)",
   "content": "content for website/social",
   "section": "hero | about | schedule | announcement",
   "platforms": ["facebook", "instagram"],
@@ -83,9 +88,13 @@ For SINGLE requests, use the standard format:
 ALWAYS respond with valid JSON. Use conversation history to maintain context about previous changes made.
 
 Examples:
-- Single: "Change ages 2 to ages 3" → type: find_replace
-- Single: "Verify the website shows ages 3" → type: verify
-- Multi: "Here's an email from Nicole: 1) update ages to 3, 2) remove phone, 3) add viewing windows section" → type: multi_task with 3 tasks`
+- "Change ages 2 to ages 3" → type: find_replace
+- "Verify the website shows ages 3" → type: verify, verifyText: "ages 3"
+- "Review the current website" → type: review (NO verifyText needed)
+- "What content is on the site?" → type: review
+- "Show me what's on the website" → type: review
+- "What does the website currently say?" → type: review
+- "Here's an email from Nicole: 1) update ages to 3, 2) remove phone" → type: multi_task with tasks`
 
 export async function POST(request: NextRequest) {
   try {

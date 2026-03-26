@@ -205,6 +205,83 @@ Just tell me what you'd like to do, or upload some content to get started!`,
             }])
             setTimeout(() => setProgressSteps([]), 3000)
           }
+        } else if (result.intent.type === 'review') {
+          // Handle website review request
+          setProgressSteps([
+            { ...VERIFY_STEPS.UNDERSTANDING, status: 'complete', detail: 'Review request detected' },
+            { ...VERIFY_STEPS.FETCHING, status: 'active', detail: 'Fetching website content...' },
+            { ...VERIFY_STEPS.SEARCHING, status: 'pending', detail: '' },
+            { ...VERIFY_STEPS.COMPLETE, status: 'pending' },
+          ])
+
+          try {
+            const reviewResponse = await fetch('/api/website/verify', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ mode: 'review' }),
+            })
+
+            setProgressSteps(prev => prev.map(s =>
+              s.id === 'fetching' ? { ...s, status: 'complete', detail: 'Website loaded' } :
+              s.id === 'searching' ? { ...s, status: 'active', detail: 'Analyzing content...' } :
+              s
+            ))
+
+            await new Promise(r => setTimeout(r, 300))
+
+            const reviewResult = await reviewResponse.json()
+
+            if (reviewResult.success && reviewResult.review) {
+              const review = reviewResult.review
+
+              setProgressSteps(prev => prev.map(s =>
+                s.id === 'searching' ? { ...s, status: 'complete', detail: `Found ${review.sections?.length || 0} sections` } :
+                s.id === 'verify-complete' ? { ...s, status: 'complete', detail: 'Review complete!' } :
+                s
+              ))
+
+              // Build a formatted review summary
+              let reviewContent = `**Website Review Complete**\n\n`
+              reviewContent += `**Title:** ${review.title}\n`
+              reviewContent += `**Word Count:** ${review.wordCount}\n\n`
+
+              if (review.keyInfo?.ages?.length) {
+                reviewContent += `**Ages Mentioned:** ${review.keyInfo.ages.join(', ')}\n`
+              }
+              if (review.keyInfo?.phoneNumbers?.length) {
+                reviewContent += `**Phone Numbers:** ${review.keyInfo.phoneNumbers.join(', ')}\n`
+              }
+              if (review.keyInfo?.emails?.length) {
+                reviewContent += `**Emails:** ${review.keyInfo.emails.join(', ')}\n`
+              }
+
+              reviewContent += `\n**Content Sections:**\n`
+              review.sections?.forEach((section: { name: string; content: string }) => {
+                reviewContent += `\n**${section.name}:**\n${section.content.substring(0, 300)}${section.content.length > 300 ? '...' : ''}\n`
+              })
+
+              setMessages(prev => [...prev, {
+                id: Date.now().toString(),
+                role: 'assistant',
+                content: reviewContent,
+                timestamp: new Date(),
+              }])
+
+              setTimeout(() => setProgressSteps([]), 3000)
+            }
+          } catch (reviewError) {
+            console.error('Review error:', reviewError)
+            setProgressSteps(prev => prev.map(s =>
+              s.id === 'fetching' || s.id === 'searching' ? { ...s, status: 'error' } : s
+            ))
+            setMessages(prev => [...prev, {
+              id: Date.now().toString(),
+              role: 'assistant',
+              content: `I tried to review the website but encountered an error. Please try again or check the website directly at https://ndce-platform.vercel.app`,
+              timestamp: new Date(),
+            }])
+            setTimeout(() => setProgressSteps([]), 3000)
+          }
         } else if (result.intent.type === 'multi_task' && result.intent.tasks) {
           // Handle multi-task requests
           setProgressSteps([])
