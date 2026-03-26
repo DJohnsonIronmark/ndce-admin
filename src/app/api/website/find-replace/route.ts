@@ -1,18 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { readFile, writeFile, copyFile, readdir, mkdir } from 'fs/promises'
+import { readFile, writeFile, copyFile, readdir, mkdir, access } from 'fs/promises'
 import { join } from 'path'
 import { exec } from 'child_process'
 import { promisify } from 'util'
+import { findAndReplace as githubFindAndReplace, isGitHubAvailable, searchInFiles } from '@/lib/github'
 
 const execAsync = promisify(exec)
 
 interface FindReplaceRequest {
   find: string
   replace: string
-  preview?: boolean // If true, just show what would change without applying
+  preview?: boolean
   caseSensitive?: boolean
-  autoDeploy?: boolean // If true, commit and deploy to Vercel immediately
-  staged?: boolean // If true, apply changes but wait for manual approval before deploying
+  autoDeploy?: boolean
+  staged?: boolean
 }
 
 interface FileMatch {
@@ -24,36 +25,18 @@ interface FileMatch {
   context: string
 }
 
-// ndce-platform paths
+// ndce-platform paths (for local development)
 const NDCE_PLATFORM_ROOT = '/Users/drewjohnson/Downloads/ProBono Kids Activities Memory/clients/nicoles-dance-center-elite/ndce-platform'
 const NDCE_PLATFORM_PATH = `${NDCE_PLATFORM_ROOT}/src`
 const BACKUP_DIR = `${NDCE_PLATFORM_ROOT}/backups`
 
-// Git commit and push to GitHub (triggers Vercel auto-deploy)
-async function commitAndDeploy(find: string, replace: string, matchCount: number): Promise<{ committed: boolean; deployed: boolean; deployUrl?: string; error?: string }> {
+// Check if local filesystem is available
+async function isLocalAvailable(): Promise<boolean> {
   try {
-    // Stage changes
-    await execAsync(`cd "${NDCE_PLATFORM_ROOT}" && git add -A`)
-
-    // Commit with descriptive message
-    const commitMessage = `Update: Replace "${find}" with "${replace}" (${matchCount} occurrences)`
-    await execAsync(`cd "${NDCE_PLATFORM_ROOT}" && git commit -m "${commitMessage}"`)
-
-    // Push to GitHub (triggers Vercel auto-deploy)
-    await execAsync(`cd "${NDCE_PLATFORM_ROOT}" && git push origin main`)
-
-    return {
-      committed: true,
-      deployed: true,
-      deployUrl: 'https://ndce-platform.vercel.app'
-    }
-  } catch (error) {
-    console.error('Commit/deploy error:', error)
-    return {
-      committed: false,
-      deployed: false,
-      error: error instanceof Error ? error.message : 'Unknown error'
-    }
+    await access(NDCE_PLATFORM_PATH)
+    return true
+  } catch {
+    return false
   }
 }
 
@@ -62,29 +45,21 @@ const SEARCH_EXTENSIONS = ['.tsx', '.ts', '.jsx', '.js']
 
 // Case-preserving replace function
 function preserveCaseReplace(original: string, find: string, replace: string): string {
-  // Check the case pattern of the found text
-  if (original === find.toUpperCase()) {
-    return replace.toUpperCase()
-  }
-  if (original === find.toLowerCase()) {
-    return replace.toLowerCase()
-  }
-  // Title case (first letter uppercase)
+  if (original === find.toUpperCase()) return replace.toUpperCase()
+  if (original === find.toLowerCase()) return replace.toLowerCase()
   if (original[0] === find[0].toUpperCase() && original.slice(1) === find.slice(1).toLowerCase()) {
     return replace[0].toUpperCase() + replace.slice(1).toLowerCase()
   }
-  // Otherwise return replacement as-is
   return replace
 }
 
-// Recursively get all files in a directory
+// Recursively get all files in a directory (local mode)
 async function getAllFiles(dir: string, files: string[] = []): Promise<string[]> {
   const entries = await readdir(dir, { withFileTypes: true })
 
   for (const entry of entries) {
     const fullPath = join(dir, entry.name)
     if (entry.isDirectory()) {
-      // Skip node_modules and other non-source directories
       if (!['node_modules', '.next', '.git', 'backups'].includes(entry.name)) {
         await getAllFiles(fullPath, files)
       }
@@ -96,157 +71,9 @@ async function getAllFiles(dir: string, files: string[] = []): Promise<string[]>
   return files
 }
 
-export async function POST(request: NextRequest) {
-  try {
-    const body: FindReplaceRequest = await request.json()
-    const { find, replace, preview = false, caseSensitive = false, autoDeploy = false, staged = true } = body
-
-    if (!find || find.trim() === '') {
-      return NextResponse.json(
-        { error: 'Find text is required' },
-        { status: 400 }
-      )
-    }
-
-    // Get all source files
-    let files: string[]
-    try {
-      files = await getAllFiles(NDCE_PLATFORM_PATH)
-    } catch (err) {
-      console.error('Error reading directory:', err)
-      return NextResponse.json(
-        { error: 'Could not read ndce-platform source directory' },
-        { status: 500 }
-      )
-    }
-
-    // Create regex for finding matches
-    const flags = caseSensitive ? 'g' : 'gi'
-    const regex = new RegExp(escapeRegex(find), flags)
-
-    // Find all matches across all files
-    const allMatches: FileMatch[] = []
-    const filesWithChanges: Map<string, string> = new Map()
-
-    for (const filePath of files) {
-      try {
-        const content = await readFile(filePath, 'utf-8')
-        const lines = content.split('\n')
-        let hasMatches = false
-
-        // Create a replacer function that preserves case
-        const replacer = caseSensitive
-          ? () => replace
-          : (match: string) => preserveCaseReplace(match, find, replace)
-
-        lines.forEach((line, index) => {
-          if (regex.test(line)) {
-            regex.lastIndex = 0
-            hasMatches = true
-
-            const newLine = line.replace(regex, replacer)
-            const relativePath = filePath.replace(NDCE_PLATFORM_PATH + '/', '')
-
-            allMatches.push({
-              file: filePath,
-              relativePath,
-              line: index + 1,
-              before: line.trim().substring(0, 200),
-              after: newLine.trim().substring(0, 200),
-              context: getContext(lines, index),
-            })
-          }
-        })
-
-        if (hasMatches) {
-          const newContent = content.replace(new RegExp(escapeRegex(find), flags), replacer)
-          filesWithChanges.set(filePath, newContent)
-        }
-      } catch (err) {
-        console.warn(`Could not read file ${filePath}:`, err)
-      }
-    }
-
-    if (allMatches.length === 0) {
-      return NextResponse.json({
-        success: false,
-        message: `No matches found for "${find}" in ndce-platform source files`,
-        matchCount: 0,
-      })
-    }
-
-    // If preview mode, just return what would change
-    if (preview) {
-      return NextResponse.json({
-        success: true,
-        preview: true,
-        matchCount: allMatches.length,
-        filesAffected: filesWithChanges.size,
-        matches: allMatches,
-        message: `Found ${allMatches.length} occurrence(s) in ${filesWithChanges.size} file(s) that would be replaced`,
-      })
-    }
-
-    // Apply the changes
-    // First, create backups
-    try {
-      await mkdir(BACKUP_DIR, { recursive: true })
-      const timestamp = Date.now()
-
-      for (const [filePath] of filesWithChanges) {
-        const relativePath = filePath.replace(NDCE_PLATFORM_PATH + '/', '')
-        const backupPath = join(BACKUP_DIR, `${timestamp}-${relativePath.replace(/\//g, '_')}`)
-        await copyFile(filePath, backupPath)
-      }
-    } catch (backupError) {
-      console.warn('Could not create backups:', backupError)
-    }
-
-    // Apply the replacements
-    for (const [filePath, newContent] of filesWithChanges) {
-      await writeFile(filePath, newContent)
-    }
-
-    // Handle deployment based on mode
-    let deployResult: { committed: boolean; deployed: boolean; deployUrl?: string; error?: string } = {
-      committed: false,
-      deployed: false,
-      deployUrl: undefined
-    }
-
-    if (autoDeploy && !staged) {
-      // Immediate deploy (old behavior)
-      deployResult = await commitAndDeploy(find, replace, allMatches.length)
-    }
-
-    // Determine response based on mode
-    const isStaged = staged && !autoDeploy
-    const message = deployResult.deployed
-      ? `Successfully replaced ${allMatches.length} occurrence(s) and deployed to ${deployResult.deployUrl}`
-      : isStaged
-        ? `Changes staged for review. ${allMatches.length} occurrence(s) in ${filesWithChanges.size} file(s) ready for approval.`
-        : `Successfully replaced ${allMatches.length} occurrence(s) in ${filesWithChanges.size} file(s)`
-
-    return NextResponse.json({
-      success: true,
-      preview: false,
-      staged: isStaged,
-      matchCount: allMatches.length,
-      filesAffected: filesWithChanges.size,
-      matches: allMatches,
-      committed: deployResult.committed,
-      deployed: deployResult.deployed,
-      deployUrl: deployResult.deployUrl,
-      requiresApproval: isStaged,
-      message,
-    })
-  } catch (error) {
-    console.error('Find-replace error:', error)
-    return NextResponse.json(
-      { error: 'Failed to process find-replace request' },
-      { status: 500 }
-    )
-  }
+// Escape special regex characters
+function escapeRegex(string: string): string {
+  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 // Get surrounding context for a match
@@ -260,9 +87,261 @@ function getContext(lines: string[], lineIndex: number): string {
     .join('\n')
 }
 
-// Escape special regex characters
-function escapeRegex(string: string): string {
-  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+// GitHub-based find and replace
+async function handleGitHubFindReplace(body: FindReplaceRequest) {
+  const { find, replace, preview = false, caseSensitive = false } = body
+
+  if (!isGitHubAvailable()) {
+    return NextResponse.json(
+      { error: 'GitHub token not configured. Set GITHUB_TOKEN environment variable.' },
+      { status: 500 }
+    )
+  }
+
+  try {
+    const result = await githubFindAndReplace(find, replace, caseSensitive, preview)
+
+    if (result.matchCount === 0) {
+      return NextResponse.json({
+        success: false,
+        message: `No matches found for "${find}" in the repository`,
+        matchCount: 0,
+        mode: 'github',
+      })
+    }
+
+    if (preview) {
+      return NextResponse.json({
+        success: true,
+        preview: true,
+        matchCount: result.matchCount,
+        filesAffected: result.filesAffected,
+        matches: result.matches.map(m => ({
+          file: m.path,
+          relativePath: m.path,
+          line: m.line,
+          before: m.before,
+          after: m.after,
+          context: `Line ${m.line}: ${m.before}`,
+        })),
+        message: `Found ${result.matchCount} occurrence(s) in ${result.filesAffected} file(s) that would be replaced`,
+        mode: 'github',
+      })
+    }
+
+    // Applied changes
+    const successCount = result.updates?.filter(u => u.success).length || 0
+    const failedUpdates = result.updates?.filter(u => !u.success) || []
+
+    return NextResponse.json({
+      success: successCount > 0,
+      preview: false,
+      staged: false,
+      matchCount: result.matchCount,
+      filesAffected: result.filesAffected,
+      filesUpdated: successCount,
+      matches: result.matches.map(m => ({
+        file: m.path,
+        relativePath: m.path,
+        line: m.line,
+        before: m.before,
+        after: m.after,
+        context: `Line ${m.line}: ${m.before}`,
+      })),
+      committed: true,
+      deployed: true,
+      deployUrl: 'https://ndce-platform.vercel.app',
+      errors: failedUpdates.length > 0 ? failedUpdates : undefined,
+      message: `Successfully replaced ${result.matchCount} occurrence(s) in ${successCount} file(s). Changes committed to GitHub and will auto-deploy to Vercel.`,
+      mode: 'github',
+    })
+  } catch (error) {
+    console.error('GitHub find-replace error:', error)
+    return NextResponse.json(
+      { error: 'Failed to process find-replace via GitHub', details: error instanceof Error ? error.message : 'Unknown error' },
+      { status: 500 }
+    )
+  }
+}
+
+// Local filesystem find and replace
+async function handleLocalFindReplace(body: FindReplaceRequest) {
+  const { find, replace, preview = false, caseSensitive = false, autoDeploy = false, staged = true } = body
+
+  // Get all source files
+  let files: string[]
+  try {
+    files = await getAllFiles(NDCE_PLATFORM_PATH)
+  } catch (err) {
+    console.error('Error reading directory:', err)
+    return NextResponse.json(
+      { error: 'Could not read ndce-platform source directory' },
+      { status: 500 }
+    )
+  }
+
+  // Create regex for finding matches
+  const flags = caseSensitive ? 'g' : 'gi'
+  const regex = new RegExp(escapeRegex(find), flags)
+
+  // Find all matches across all files
+  const allMatches: FileMatch[] = []
+  const filesWithChanges: Map<string, string> = new Map()
+
+  // Create a replacer function that preserves case
+  const replacer = caseSensitive
+    ? () => replace
+    : (match: string) => preserveCaseReplace(match, find, replace)
+
+  for (const filePath of files) {
+    try {
+      const content = await readFile(filePath, 'utf-8')
+      const lines = content.split('\n')
+      let hasMatches = false
+
+      lines.forEach((line, index) => {
+        if (regex.test(line)) {
+          regex.lastIndex = 0
+          hasMatches = true
+
+          const newLine = line.replace(regex, replacer)
+          const relativePath = filePath.replace(NDCE_PLATFORM_PATH + '/', '')
+
+          allMatches.push({
+            file: filePath,
+            relativePath,
+            line: index + 1,
+            before: line.trim().substring(0, 200),
+            after: newLine.trim().substring(0, 200),
+            context: getContext(lines, index),
+          })
+        }
+      })
+
+      if (hasMatches) {
+        const newContent = content.replace(new RegExp(escapeRegex(find), flags), replacer)
+        filesWithChanges.set(filePath, newContent)
+      }
+    } catch (err) {
+      console.warn(`Could not read file ${filePath}:`, err)
+    }
+  }
+
+  if (allMatches.length === 0) {
+    return NextResponse.json({
+      success: false,
+      message: `No matches found for "${find}" in ndce-platform source files`,
+      matchCount: 0,
+      mode: 'local',
+    })
+  }
+
+  // If preview mode, just return what would change
+  if (preview) {
+    return NextResponse.json({
+      success: true,
+      preview: true,
+      matchCount: allMatches.length,
+      filesAffected: filesWithChanges.size,
+      matches: allMatches,
+      message: `Found ${allMatches.length} occurrence(s) in ${filesWithChanges.size} file(s) that would be replaced`,
+      mode: 'local',
+    })
+  }
+
+  // Apply the changes
+  // First, create backups
+  try {
+    await mkdir(BACKUP_DIR, { recursive: true })
+    const timestamp = Date.now()
+
+    for (const [filePath] of filesWithChanges) {
+      const relativePath = filePath.replace(NDCE_PLATFORM_PATH + '/', '')
+      const backupPath = join(BACKUP_DIR, `${timestamp}-${relativePath.replace(/\//g, '_')}`)
+      await copyFile(filePath, backupPath)
+    }
+  } catch (backupError) {
+    console.warn('Could not create backups:', backupError)
+  }
+
+  // Apply the replacements
+  for (const [filePath, newContent] of filesWithChanges) {
+    await writeFile(filePath, newContent)
+  }
+
+  // Handle deployment based on mode
+  let deployResult: { committed: boolean; deployed: boolean; deployUrl?: string; error?: string } = {
+    committed: false,
+    deployed: false,
+    deployUrl: undefined
+  }
+
+  if (autoDeploy && !staged) {
+    // Immediate deploy via git
+    try {
+      await execAsync(`cd "${NDCE_PLATFORM_ROOT}" && git add -A`)
+      const commitMessage = `Update: Replace "${find}" with "${replace}" (${allMatches.length} occurrences)`
+      await execAsync(`cd "${NDCE_PLATFORM_ROOT}" && git commit -m "${commitMessage}"`)
+      await execAsync(`cd "${NDCE_PLATFORM_ROOT}" && git push origin main`)
+      deployResult = { committed: true, deployed: true, deployUrl: 'https://ndce-platform.vercel.app' }
+    } catch (error) {
+      console.error('Commit/deploy error:', error)
+      deployResult = { committed: false, deployed: false, error: error instanceof Error ? error.message : 'Unknown error' }
+    }
+  }
+
+  const isStaged = staged && !autoDeploy
+  const message = deployResult.deployed
+    ? `Successfully replaced ${allMatches.length} occurrence(s) and deployed to ${deployResult.deployUrl}`
+    : isStaged
+      ? `Changes staged for review. ${allMatches.length} occurrence(s) in ${filesWithChanges.size} file(s) ready for approval.`
+      : `Successfully replaced ${allMatches.length} occurrence(s) in ${filesWithChanges.size} file(s)`
+
+  return NextResponse.json({
+    success: true,
+    preview: false,
+    staged: isStaged,
+    matchCount: allMatches.length,
+    filesAffected: filesWithChanges.size,
+    matches: allMatches,
+    committed: deployResult.committed,
+    deployed: deployResult.deployed,
+    deployUrl: deployResult.deployUrl,
+    requiresApproval: isStaged,
+    message,
+    mode: 'local',
+  })
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const body: FindReplaceRequest = await request.json()
+    const { find } = body
+
+    if (!find || find.trim() === '') {
+      return NextResponse.json(
+        { error: 'Find text is required' },
+        { status: 400 }
+      )
+    }
+
+    // Check if local filesystem is available
+    const localAvailable = await isLocalAvailable()
+
+    if (localAvailable) {
+      // Use local filesystem (development mode)
+      return handleLocalFindReplace(body)
+    } else {
+      // Use GitHub API (production/deployed mode)
+      return handleGitHubFindReplace(body)
+    }
+  } catch (error) {
+    console.error('Find-replace error:', error)
+    return NextResponse.json(
+      { error: 'Failed to process find-replace request' },
+      { status: 500 }
+    )
+  }
 }
 
 // GET endpoint to search for text
@@ -277,6 +356,41 @@ export async function GET(request: NextRequest) {
     )
   }
 
+  // Check if local filesystem is available
+  const localAvailable = await isLocalAvailable()
+
+  if (!localAvailable) {
+    // Use GitHub search
+    if (!isGitHubAvailable()) {
+      return NextResponse.json(
+        { error: 'Neither local files nor GitHub token available' },
+        { status: 500 }
+      )
+    }
+
+    try {
+      const matches = await searchInFiles(query)
+      return NextResponse.json({
+        success: true,
+        query,
+        matchCount: matches.length,
+        matches: matches.map(m => ({
+          file: m.path,
+          relativePath: m.path,
+          line: m.line,
+          content: m.content,
+        })),
+        mode: 'github',
+      })
+    } catch (error) {
+      return NextResponse.json(
+        { error: 'Could not search repository' },
+        { status: 500 }
+      )
+    }
+  }
+
+  // Local search
   try {
     const files = await getAllFiles(NDCE_PLATFORM_PATH)
     const regex = new RegExp(escapeRegex(query), 'gi')
@@ -309,6 +423,7 @@ export async function GET(request: NextRequest) {
       query,
       matchCount: matches.length,
       matches,
+      mode: 'local',
     })
   } catch {
     return NextResponse.json(
