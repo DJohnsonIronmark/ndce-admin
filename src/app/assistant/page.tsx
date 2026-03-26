@@ -2,7 +2,7 @@
 
 import { useState, useRef } from 'react'
 import Sidebar from '@/components/Sidebar'
-import { Send, Upload, Image, Video, FileText, Sparkles, Globe, MessageSquare, X, Check, Loader2, Clock, CheckCircle, XCircle, Rocket } from 'lucide-react'
+import { Send, Upload, Image, Video, FileText, Sparkles, Globe, MessageSquare, X, Check, Loader2, Clock, CheckCircle, XCircle, Rocket, ListTodo, Play, AlertCircle } from 'lucide-react'
 import ProgressTracker, { ProgressStep, UPDATE_STEPS, VERIFY_STEPS } from '@/components/ProgressTracker'
 
 interface Message {
@@ -24,7 +24,7 @@ interface Attachment {
 
 interface Suggestion {
   id: string
-  type: 'website_update' | 'social_post' | 'find_replace'
+  type: 'website_update' | 'social_post' | 'find_replace' | 'verify'
   title: string
   description: string
   content: string
@@ -36,8 +36,23 @@ interface Suggestion {
   replaceText?: string
   matchCount?: number
   filesAffected?: number
+  // For verify operations
+  verifyText?: string
   // For staged changes requiring approval
   requiresApproval?: boolean
+}
+
+interface TaskItem {
+  id: string
+  type: 'find_replace' | 'website_update' | 'social_post' | 'verify' | 'question'
+  description: string
+  findText?: string
+  replaceText?: string
+  verifyText?: string
+  content?: string
+  section?: string
+  status: 'pending' | 'ready' | 'in_progress' | 'completed' | 'error'
+  result?: string
 }
 
 interface StagedChange {
@@ -78,8 +93,18 @@ Just tell me what you'd like to do, or upload some content to get started!`,
   const [stagedChanges, setStagedChanges] = useState<StagedChange[]>([])
   const [progressSteps, setProgressSteps] = useState<ProgressStep[]>([])
   const [isPublishing, setIsPublishing] = useState(false)
+  const [taskList, setTaskList] = useState<TaskItem[]>([])
+  const [isProcessingTask, setIsProcessingTask] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+
+  // Get conversation history for AI context
+  const getConversationHistory = () => {
+    return messages.map(m => ({
+      role: m.role,
+      content: m.content,
+    }))
+  }
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -104,11 +129,14 @@ Just tell me what you'd like to do, or upload some content to get started!`,
         { ...VERIFY_STEPS.UNDERSTANDING, status: 'active' },
       ])
 
-      // Call real AI endpoint
+      // Call real AI endpoint with conversation history
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: input }),
+        body: JSON.stringify({
+          message: input,
+          history: getConversationHistory(),
+        }),
       })
 
       const result = await response.json()
@@ -177,8 +205,43 @@ Just tell me what you'd like to do, or upload some content to get started!`,
             }])
             setTimeout(() => setProgressSteps([]), 3000)
           }
+        } else if (result.intent.type === 'multi_task' && result.intent.tasks) {
+          // Handle multi-task requests
+          setProgressSteps([])
+
+          // Convert tasks to TaskItem format with IDs
+          const tasks: TaskItem[] = result.intent.tasks.map((task: {
+            type: string
+            description: string
+            findText?: string
+            replaceText?: string
+            verifyText?: string
+            content?: string
+            section?: string
+            status: string
+          }, index: number) => ({
+            id: `task-${Date.now()}-${index}`,
+            type: task.type as TaskItem['type'],
+            description: task.description,
+            findText: task.findText,
+            replaceText: task.replaceText,
+            verifyText: task.verifyText,
+            content: task.content,
+            section: task.section,
+            status: task.status === 'ready' ? 'ready' : 'pending',
+          }))
+
+          setTaskList(tasks)
+
+          // Add message explaining the tasks
+          setMessages(prev => [...prev, {
+            id: Date.now().toString(),
+            role: 'assistant',
+            content: result.intent.response || `I found **${tasks.length} tasks** in your request. Review them in the task panel and click "Run" to execute each one, or "Run All" to process them in sequence.`,
+            timestamp: new Date(),
+          }])
         } else {
-          // Clear progress for non-verify intents
+          // Clear progress for other intents
           setProgressSteps([])
           const aiResponse = await processAIIntent(result.intent, attachments)
           setMessages(prev => [...prev, aiResponse])
@@ -920,6 +983,101 @@ Just tell me what you'd like to do, or upload some content to get started!`,
     }
   }
 
+  // Execute a single task from the task list
+  const executeTask = async (taskId: string) => {
+    const task = taskList.find(t => t.id === taskId)
+    if (!task) return
+
+    setIsProcessingTask(true)
+    setTaskList(prev => prev.map(t =>
+      t.id === taskId ? { ...t, status: 'in_progress' } : t
+    ))
+
+    try {
+      if (task.type === 'find_replace' && task.findText && task.replaceText) {
+        // Execute find-replace
+        const response = await fetch('/api/website/find-replace', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            find: task.findText,
+            replace: task.replaceText,
+            preview: false,
+            staged: true,
+            autoDeploy: false,
+          }),
+        })
+        const result = await response.json()
+
+        if (result.success && result.matchCount > 0) {
+          setTaskList(prev => prev.map(t =>
+            t.id === taskId ? { ...t, status: 'completed', result: `Replaced ${result.matchCount} occurrence(s) in ${result.filesAffected} file(s)` } : t
+          ))
+
+          // Add to staged changes
+          setStagedChanges(prev => [...prev, {
+            suggestionId: taskId,
+            messageId: 'task',
+            findText: task.findText!,
+            replaceText: task.replaceText!,
+            matchCount: result.matchCount,
+            filesAffected: result.filesAffected,
+          }])
+        } else {
+          setTaskList(prev => prev.map(t =>
+            t.id === taskId ? { ...t, status: 'error', result: result.message || 'No matches found' } : t
+          ))
+        }
+      } else if (task.type === 'verify' && task.verifyText) {
+        // Execute verification
+        const response = await fetch('/api/website/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ searchText: task.verifyText }),
+        })
+        const result = await response.json()
+
+        if (result.success) {
+          setTaskList(prev => prev.map(t =>
+            t.id === taskId ? {
+              ...t,
+              status: 'completed',
+              result: result.found
+                ? `Found "${task.verifyText}" ${result.match?.count || 1} time(s)`
+                : `"${task.verifyText}" not found on website`
+            } : t
+          ))
+        }
+      } else {
+        // Mark as pending - needs more info
+        setTaskList(prev => prev.map(t =>
+          t.id === taskId ? { ...t, status: 'pending', result: 'This task needs more information or manual implementation' } : t
+        ))
+      }
+    } catch (error) {
+      console.error('Task execution error:', error)
+      setTaskList(prev => prev.map(t =>
+        t.id === taskId ? { ...t, status: 'error', result: 'Failed to execute task' } : t
+      ))
+    } finally {
+      setIsProcessingTask(false)
+    }
+  }
+
+  // Execute all ready tasks in sequence
+  const executeAllTasks = async () => {
+    const readyTasks = taskList.filter(t => t.status === 'ready' || t.status === 'pending')
+    for (const task of readyTasks) {
+      await executeTask(task.id)
+      await new Promise(r => setTimeout(r, 500)) // Small delay between tasks
+    }
+  }
+
+  // Clear task list
+  const clearTasks = () => {
+    setTaskList([])
+  }
+
   const useExamplePrompt = (prompt: string) => {
     setInput(prompt)
   }
@@ -983,6 +1141,79 @@ Just tell me what you'd like to do, or upload some content to get started!`,
             {progressSteps.length > 0 && (
               <div className="px-6 py-3 bg-gray-50 border-b">
                 <ProgressTracker steps={progressSteps} title="Update Progress" />
+              </div>
+            )}
+
+            {/* Task List Panel */}
+            {taskList.length > 0 && (
+              <div className="bg-blue-50 border-b border-blue-200 px-6 py-4">
+                <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center gap-2">
+                    <ListTodo className="h-5 w-5 text-blue-600" />
+                    <h3 className="font-medium text-blue-900">Task List ({taskList.length} items)</h3>
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={clearTasks}
+                      className="text-xs text-gray-500 hover:text-gray-700"
+                    >
+                      Clear
+                    </button>
+                    <button
+                      onClick={executeAllTasks}
+                      disabled={isProcessingTask}
+                      className="flex items-center gap-1 rounded bg-blue-600 px-3 py-1 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+                    >
+                      {isProcessingTask ? <Loader2 className="h-3 w-3 animate-spin" /> : <Play className="h-3 w-3" />}
+                      Run All Ready Tasks
+                    </button>
+                  </div>
+                </div>
+                <div className="space-y-2 max-h-64 overflow-y-auto">
+                  {taskList.map((task) => (
+                    <div
+                      key={task.id}
+                      className={`flex items-center justify-between rounded-lg border p-3 ${
+                        task.status === 'completed' ? 'border-green-200 bg-green-50' :
+                        task.status === 'error' ? 'border-red-200 bg-red-50' :
+                        task.status === 'in_progress' ? 'border-blue-300 bg-blue-100' :
+                        task.status === 'ready' ? 'border-blue-200 bg-white' :
+                        'border-gray-200 bg-white'
+                      }`}
+                    >
+                      <div className="flex items-center gap-3 flex-1 min-w-0">
+                        <div className="flex-shrink-0">
+                          {task.status === 'completed' && <CheckCircle className="h-4 w-4 text-green-600" />}
+                          {task.status === 'error' && <XCircle className="h-4 w-4 text-red-600" />}
+                          {task.status === 'in_progress' && <Loader2 className="h-4 w-4 text-blue-600 animate-spin" />}
+                          {task.status === 'ready' && <Play className="h-4 w-4 text-blue-600" />}
+                          {task.status === 'pending' && <AlertCircle className="h-4 w-4 text-amber-500" />}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-gray-900 truncate">{task.description}</p>
+                          <p className="text-xs text-gray-500">
+                            {task.type === 'find_replace' && task.findText && (
+                              <span>Replace "{task.findText}" → "{task.replaceText}"</span>
+                            )}
+                            {task.type === 'verify' && task.verifyText && (
+                              <span>Verify "{task.verifyText}" on website</span>
+                            )}
+                            {task.result && <span className="ml-2 italic">— {task.result}</span>}
+                          </p>
+                        </div>
+                      </div>
+                      {(task.status === 'ready' || task.status === 'pending') && (
+                        <button
+                          onClick={() => executeTask(task.id)}
+                          disabled={isProcessingTask}
+                          className="flex-shrink-0 ml-2 rounded bg-blue-600 px-2 py-1 text-xs text-white hover:bg-blue-700 disabled:opacity-50"
+                        >
+                          Run
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
 
