@@ -109,7 +109,7 @@ Just tell me what you'd like to do, or upload some content to get started!`,
       const result = await response.json()
 
       if (result.success && result.intent) {
-        const aiResponse = processAIIntent(result.intent, attachments)
+        const aiResponse = await processAIIntent(result.intent, attachments)
         setMessages(prev => [...prev, aiResponse])
       } else {
         // Fallback to pattern matching if AI fails
@@ -127,16 +127,61 @@ Just tell me what you'd like to do, or upload some content to get started!`,
   }
 
   // Process AI intent into a message with suggestions
-  const processAIIntent = (intent: {
+  const processAIIntent = async (intent: {
     type: string
     findText?: string
     replaceText?: string
+    verifyText?: string
     content?: string
     section?: string
     platforms?: string[]
     response: string
-  }, userAttachments: Attachment[]): Message => {
+  }, userAttachments: Attachment[]): Promise<Message> => {
     const suggestions: Suggestion[] = []
+
+    // Handle verification requests
+    if (intent.type === 'verify') {
+      if (intent.verifyText) {
+        // Call the verify API to check the live website
+        try {
+          const verifyResponse = await fetch('/api/website/verify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ searchText: intent.verifyText }),
+          })
+          const verifyResult = await verifyResponse.json()
+
+          if (verifyResult.success) {
+            const found = verifyResult.found
+            const match = verifyResult.match
+            return {
+              id: Date.now().toString(),
+              role: 'assistant',
+              content: found
+                ? `**Verified!** I checked the live website and found **"${intent.verifyText}"** ${match?.count || 1} time(s).\n\nContext: *"${match?.context || ''}"*`
+                : `**Not Found.** I checked the live website but could not find **"${intent.verifyText}"**. The change may not have been deployed yet, or the text might be slightly different.`,
+              timestamp: new Date(),
+            }
+          }
+        } catch (error) {
+          console.error('Verify error:', error)
+          return {
+            id: Date.now().toString(),
+            role: 'assistant',
+            content: `I tried to verify the website but encountered an error. Please try again or check the website directly at https://ndce-platform.vercel.app`,
+            timestamp: new Date(),
+          }
+        }
+      } else {
+        // No specific text to verify - ask what to look for
+        return {
+          id: Date.now().toString(),
+          role: 'assistant',
+          content: `I can check the live website for you! What specific text should I look for? For example, tell me "verify the website shows ages 3" or "check if the phone number is 813-555-1234".`,
+          timestamp: new Date(),
+        }
+      }
+    }
 
     if (intent.type === 'find_replace' && intent.findText && intent.replaceText) {
       suggestions.push({

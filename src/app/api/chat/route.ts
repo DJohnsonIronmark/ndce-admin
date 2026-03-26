@@ -11,9 +11,10 @@ interface ChatRequest {
 }
 
 interface ParsedIntent {
-  type: 'find_replace' | 'website_update' | 'social_post' | 'question' | 'unknown'
+  type: 'find_replace' | 'website_update' | 'social_post' | 'verify' | 'question' | 'unknown'
   findText?: string
   replaceText?: string
+  verifyText?: string
   content?: string
   section?: string
   platforms?: string[]
@@ -26,17 +27,22 @@ Your capabilities:
 1. **Find & Replace**: Detect when users want to update text across the website (e.g., "change ages 2 to ages 3", "update the phone number from X to Y")
 2. **Website Updates**: Help create or modify website content sections
 3. **Social Posts**: Generate engaging social media content for Facebook and Instagram
-4. **Answer Questions**: Help with general questions about the studio
+4. **Verify Changes**: Check if specific text appears on the live website (e.g., "verify the website shows ages 3", "check if the changes were made", "can you see the update on the website")
+5. **Answer Questions**: Help with general questions about the studio
 
 When you detect a find/replace request, extract:
 - The text to find (findText)
 - The text to replace it with (replaceText)
 
+When you detect a verification request, extract:
+- The text to verify (verifyText) - the specific text they want to check for on the website
+
 ALWAYS respond with valid JSON in this exact format:
 {
-  "type": "find_replace" | "website_update" | "social_post" | "question" | "unknown",
+  "type": "find_replace" | "website_update" | "social_post" | "verify" | "question" | "unknown",
   "findText": "text to find (only for find_replace)",
   "replaceText": "replacement text (only for find_replace)",
+  "verifyText": "text to search for on live website (only for verify)",
   "content": "generated content for website updates or social posts",
   "section": "hero | about | schedule | announcement (for website updates)",
   "platforms": ["facebook", "instagram"] (for social posts),
@@ -47,7 +53,11 @@ Examples:
 - "Update the minimum age from 2 to 3 across the site" → type: find_replace, findText: "ages 2", replaceText: "ages 3"
 - "Change the phone number to 813-555-1234" → type: find_replace, findText: current phone, replaceText: "813-555-1234"
 - "Write a post about our summer camp" → type: social_post with generated content
-- "Update the hero section to promote fall registration" → type: website_update with content`
+- "Update the hero section to promote fall registration" → type: website_update with content
+- "Can you verify the website shows ages 3 now?" → type: verify, verifyText: "ages 3"
+- "Check if the changes were made" → type: verify (ask for specific text in response)
+- "Does the website say ages 3?" → type: verify, verifyText: "ages 3"
+- "Can you see the update on the website?" → type: verify (ask for specific text in response)`
 
 export async function POST(request: NextRequest) {
   try {
