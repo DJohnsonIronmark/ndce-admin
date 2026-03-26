@@ -76,3 +76,10 @@ export const UPDATE_STEPS = {
   DEPLOYING: { id: 'deploying', label: 'Deploying to Vercel', status: 'pending' as const },
   COMPLETE: { id: 'complete', label: 'Update complete', status: 'pending' as const },
 }
+
+export const VERIFY_STEPS = {
+  UNDERSTANDING: { id: 'understanding', label: 'Understanding request', status: 'pending' as const },
+  FETCHING: { id: 'fetching', label: 'Fetching live website', status: 'pending' as const },
+  SEARCHING: { id: 'searching', label: 'Searching for text', status: 'pending' as const },
+  COMPLETE: { id: 'verify-complete', label: 'Verification complete', status: 'pending' as const },
+}

@@ -3,7 +3,7 @@
 import { useState, useRef } from 'react'
 import Sidebar from '@/components/Sidebar'
 import { Send, Upload, Image, Video, FileText, Sparkles, Globe, MessageSquare, X, Check, Loader2, Clock, CheckCircle, XCircle, Rocket } from 'lucide-react'
-import ProgressTracker, { ProgressStep, UPDATE_STEPS } from '@/components/ProgressTracker'
+import ProgressTracker, { ProgressStep, UPDATE_STEPS, VERIFY_STEPS } from '@/components/ProgressTracker'
 
 interface Message {
   id: string
@@ -99,6 +99,11 @@ Just tell me what you'd like to do, or upload some content to get started!`,
     setIsLoading(true)
 
     try {
+      // Show initial progress for understanding
+      setProgressSteps([
+        { ...VERIFY_STEPS.UNDERSTANDING, status: 'active' },
+      ])
+
       // Call real AI endpoint
       const response = await fetch('/api/chat', {
         method: 'POST',
@@ -109,16 +114,85 @@ Just tell me what you'd like to do, or upload some content to get started!`,
       const result = await response.json()
 
       if (result.success && result.intent) {
-        const aiResponse = await processAIIntent(result.intent, attachments)
-        setMessages(prev => [...prev, aiResponse])
+        // Handle verify intent with progress tracking
+        if (result.intent.type === 'verify' && result.intent.verifyText) {
+          setProgressSteps([
+            { ...VERIFY_STEPS.UNDERSTANDING, status: 'complete', detail: 'Detected verification request' },
+            { ...VERIFY_STEPS.FETCHING, status: 'active' },
+            { ...VERIFY_STEPS.SEARCHING, status: 'pending' },
+            { ...VERIFY_STEPS.COMPLETE, status: 'pending' },
+          ])
+
+          await new Promise(r => setTimeout(r, 300))
+
+          try {
+            const verifyResponse = await fetch('/api/website/verify', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ searchText: result.intent.verifyText }),
+            })
+
+            setProgressSteps(prev => prev.map(s =>
+              s.id === 'fetching' ? { ...s, status: 'complete', detail: 'Website loaded' } :
+              s.id === 'searching' ? { ...s, status: 'active', detail: `Looking for "${result.intent.verifyText}"` } :
+              s
+            ))
+
+            await new Promise(r => setTimeout(r, 300))
+
+            const verifyResult = await verifyResponse.json()
+
+            if (verifyResult.success) {
+              const found = verifyResult.found
+              const match = verifyResult.match
+
+              setProgressSteps(prev => prev.map(s =>
+                s.id === 'searching' ? { ...s, status: 'complete', detail: found ? `Found ${match?.count || 1} match(es)` : 'Not found' } :
+                s.id === 'verify-complete' ? { ...s, status: 'complete', detail: found ? 'Text verified!' : 'Text not found' } :
+                s
+              ))
+
+              setMessages(prev => [...prev, {
+                id: Date.now().toString(),
+                role: 'assistant',
+                content: found
+                  ? `**Verified!** I checked the live website and found **"${result.intent.verifyText}"** ${match?.count || 1} time(s).\n\nContext: *"${match?.context || ''}"*`
+                  : `**Not Found.** I checked the live website but could not find **"${result.intent.verifyText}"**. The change may not have been deployed yet, or the text might be slightly different.`,
+                timestamp: new Date(),
+              }])
+
+              // Clear progress after delay
+              setTimeout(() => setProgressSteps([]), 3000)
+            }
+          } catch (verifyError) {
+            console.error('Verify error:', verifyError)
+            setProgressSteps(prev => prev.map(s =>
+              s.id === 'fetching' || s.id === 'searching' ? { ...s, status: 'error' } : s
+            ))
+            setMessages(prev => [...prev, {
+              id: Date.now().toString(),
+              role: 'assistant',
+              content: `I tried to verify the website but encountered an error. Please try again or check the website directly at https://ndce-platform.vercel.app`,
+              timestamp: new Date(),
+            }])
+            setTimeout(() => setProgressSteps([]), 3000)
+          }
+        } else {
+          // Clear progress for non-verify intents
+          setProgressSteps([])
+          const aiResponse = await processAIIntent(result.intent, attachments)
+          setMessages(prev => [...prev, aiResponse])
+        }
       } else {
         // Fallback to pattern matching if AI fails
+        setProgressSteps([])
         const aiResponse = generateAIResponse(input, attachments)
         setMessages(prev => [...prev, aiResponse])
       }
     } catch (error) {
       console.error('AI chat error:', error)
       // Fallback to pattern matching
+      setProgressSteps([])
       const aiResponse = generateAIResponse(input, attachments)
       setMessages(prev => [...prev, aiResponse])
     }
