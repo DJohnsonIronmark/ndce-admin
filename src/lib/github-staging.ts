@@ -23,9 +23,30 @@ export interface StagedChanges {
   status: 'pending' | 'approved' | 'rejected'
 }
 
+// Generic staged change for file operations
+export interface GenericStagedChange {
+  id: string
+  type: 'find_replace' | 'file_write' | 'file_edit' | 'file_delete'
+  createdAt: string
+  status?: 'pending' | 'approved' | 'rejected'
+  // For find_replace
+  findText?: string
+  replaceText?: string
+  files?: StagedFile[]
+  matchCount?: number
+  // For file operations
+  path?: string
+  content?: string
+  sha?: string
+  description?: string
+  oldContent?: string
+  newContent?: string
+}
+
 // In-memory store for staged changes (persists across requests in same instance)
 // For production, consider using Vercel KV or a database
 const stagedChangesStore = new Map<string, StagedChanges>()
+const genericStagedStore = new Map<string, GenericStagedChange>()
 
 // Generate a unique ID for staged changes
 export function generateStagingId(): string {
@@ -82,4 +103,49 @@ export function removeStagedChanges(id: string): boolean {
 // Clear all staged changes
 export function clearAllStaged(): void {
   stagedChangesStore.clear()
+  genericStagedStore.clear()
+}
+
+// Add a generic staged change (for file operations)
+export function addStagedChange(change: Omit<GenericStagedChange, 'status'>): GenericStagedChange {
+  const staged: GenericStagedChange = {
+    ...change,
+    status: 'pending',
+  }
+  genericStagedStore.set(change.id, staged)
+
+  // Clean up old staged changes (older than 1 hour)
+  const oneHourAgo = Date.now() - 60 * 60 * 1000
+  for (const [key, value] of genericStagedStore.entries()) {
+    if (new Date(value.createdAt).getTime() < oneHourAgo) {
+      genericStagedStore.delete(key)
+    }
+  }
+
+  return staged
+}
+
+// Get a generic staged change
+export function getGenericStagedChange(id: string): GenericStagedChange | undefined {
+  return genericStagedStore.get(id)
+}
+
+// Get all generic pending changes
+export function getAllGenericPendingChanges(): GenericStagedChange[] {
+  return Array.from(genericStagedStore.values())
+    .filter(c => c.status === 'pending')
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+}
+
+// Update generic staged change status
+export function updateGenericStagedStatus(id: string, status: 'approved' | 'rejected'): boolean {
+  const staged = genericStagedStore.get(id)
+  if (!staged) return false
+  staged.status = status
+  return true
+}
+
+// Remove generic staged change
+export function removeGenericStagedChange(id: string): boolean {
+  return genericStagedStore.delete(id)
 }

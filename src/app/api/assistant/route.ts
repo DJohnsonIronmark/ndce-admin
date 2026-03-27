@@ -157,6 +157,38 @@ export async function POST(request: NextRequest) {
           })
         }
 
+        // Check if this is a staged file write
+        if (toolUse.name === 'write_file' && result.includes('Staged for Approval')) {
+          const input = toolUse.input as { path?: string; description?: string; content?: string }
+          const stagingIdMatch = result.match(/Staging ID:\s*(\S+)/)
+
+          stagedChanges.push({
+            id: `staged-${Date.now()}-${stagedChanges.length}`,
+            type: 'website_update',
+            title: 'File Write',
+            description: input.description || `Create/update ${input.path}`,
+            section: input.path,
+            content: input.content,
+            stagingId: stagingIdMatch ? stagingIdMatch[1] : '',
+          })
+        }
+
+        // Check if this is a staged file edit
+        if (toolUse.name === 'edit_file' && result.includes('Staged for Approval')) {
+          const input = toolUse.input as { path?: string; description?: string; oldContent?: string; newContent?: string }
+          const stagingIdMatch = result.match(/Staging ID:\s*(\S+)/)
+
+          stagedChanges.push({
+            id: `staged-${Date.now()}-${stagedChanges.length}`,
+            type: 'website_update',
+            title: 'File Edit',
+            description: input.description || `Edit ${input.path}`,
+            section: input.path,
+            content: `Old: ${input.oldContent?.substring(0, 100)}...\nNew: ${input.newContent?.substring(0, 100)}...`,
+            stagingId: stagingIdMatch ? stagingIdMatch[1] : '',
+          })
+        }
+
         toolResults.push({
           name: toolUse.name,
           input: toolUse.input,

@@ -2,6 +2,7 @@
 // These tools give the assistant Claude Code-like capabilities
 
 import Anthropic from '@anthropic-ai/sdk'
+import { listFiles as ghListFiles, getFileContent, updateFile, searchInFiles, isGitHubAvailable } from './github'
 
 export const ASSISTANT_TOOLS: Anthropic.Tool[] = [
   {
@@ -130,6 +131,97 @@ export const ASSISTANT_TOOLS: Anthropic.Tool[] = [
         },
       },
       required: ['tasks'],
+    },
+  },
+  // ========== ADVANCED FILE TOOLS ==========
+  {
+    name: 'list_files',
+    description: 'List all source files in the website codebase. Returns file paths organized by directory. Use this to understand the project structure before making changes.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        directory: {
+          type: 'string',
+          description: 'The directory to list files from (default: "src"). Examples: "src", "src/components", "src/app"',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'read_file',
+    description: 'Read the full content of a source file. Use this to understand existing code before making changes. Always read a file before trying to edit it.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        path: {
+          type: 'string',
+          description: 'The file path relative to the repository root. Example: "src/components/Header.tsx"',
+        },
+      },
+      required: ['path'],
+    },
+  },
+  {
+    name: 'write_file',
+    description: 'Create a new file or completely replace an existing file. This stages the changes for human approval - they will NOT go live until approved. Use edit_file for targeted changes to existing files.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        path: {
+          type: 'string',
+          description: 'The file path relative to the repository root. Example: "src/components/NewComponent.tsx"',
+        },
+        content: {
+          type: 'string',
+          description: 'The complete file content to write',
+        },
+        description: {
+          type: 'string',
+          description: 'Brief description of what this file does or why it was created',
+        },
+      },
+      required: ['path', 'content', 'description'],
+    },
+  },
+  {
+    name: 'edit_file',
+    description: 'Make a targeted edit to a specific part of a file by replacing old content with new content. This stages the changes for human approval. Always read the file first to get the exact text to replace.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        path: {
+          type: 'string',
+          description: 'The file path relative to the repository root',
+        },
+        oldContent: {
+          type: 'string',
+          description: 'The exact text to find and replace (must match exactly, including whitespace)',
+        },
+        newContent: {
+          type: 'string',
+          description: 'The new text to replace it with',
+        },
+        description: {
+          type: 'string',
+          description: 'Brief description of what this edit does',
+        },
+      },
+      required: ['path', 'oldContent', 'newContent', 'description'],
+    },
+  },
+  {
+    name: 'get_component_info',
+    description: 'Get information about a React component including its props, structure, and where it is used. Useful for understanding how to modify or extend components.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        componentName: {
+          type: 'string',
+          description: 'The name of the component to analyze. Example: "Header", "ContactSection"',
+        },
+      },
+      required: ['componentName'],
     },
   },
 ]
@@ -287,6 +379,209 @@ export async function executeTool(
         })
       }
 
+      // ========== ADVANCED FILE TOOLS ==========
+
+      case 'list_files': {
+        if (!isGitHubAvailable()) {
+          return 'Error: GitHub integration is not configured. Cannot access source files.'
+        }
+        const { directory = 'src' } = toolInput as { directory?: string }
+        try {
+          const files = await ghListFiles(directory)
+
+          // Group files by directory
+          const grouped: Record<string, string[]> = {}
+          for (const file of files) {
+            const dir = file.path.split('/').slice(0, -1).join('/')
+            if (!grouped[dir]) grouped[dir] = []
+            grouped[dir].push(file.name)
+          }
+
+          let result = `## Files in ${directory}\n\n`
+          result += `**Total files:** ${files.length}\n\n`
+
+          for (const [dir, fileNames] of Object.entries(grouped).sort()) {
+            result += `### ${dir}/\n`
+            for (const name of fileNames.sort()) {
+              result += `- ${name}\n`
+            }
+            result += '\n'
+          }
+
+          return result
+        } catch (error) {
+          return `Error listing files: ${error instanceof Error ? error.message : 'Unknown error'}`
+        }
+      }
+
+      case 'read_file': {
+        if (!isGitHubAvailable()) {
+          return 'Error: GitHub integration is not configured. Cannot read source files.'
+        }
+        const { path } = toolInput as { path: string }
+        try {
+          const { content, sha } = await getFileContent(path)
+
+          // Add line numbers for easier reference
+          const lines = content.split('\n')
+          const numberedContent = lines.map((line, i) => `${String(i + 1).padStart(4, ' ')} | ${line}`).join('\n')
+
+          return `## File: ${path}\n\n**SHA:** ${sha}\n**Lines:** ${lines.length}\n\n\`\`\`\n${numberedContent}\n\`\`\``
+        } catch (error) {
+          return `Error reading file "${path}": ${error instanceof Error ? error.message : 'Unknown error'}`
+        }
+      }
+
+      case 'write_file': {
+        if (!isGitHubAvailable()) {
+          return 'Error: GitHub integration is not configured. Cannot write files.'
+        }
+        const { path, content, description } = toolInput as { path: string; content: string; description: string }
+        try {
+          // Check if file exists to get its SHA
+          let sha: string | undefined
+          try {
+            const existing = await getFileContent(path)
+            sha = existing.sha
+          } catch {
+            // File doesn't exist, that's fine for creating new files
+          }
+
+          // Stage the write operation
+          const response = await fetch(`${baseUrl}/api/website/file-operation`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              operation: 'write',
+              path,
+              content,
+              sha,
+              description,
+            }),
+          })
+
+          const data = await response.json()
+
+          if (data.success) {
+            const action = sha ? 'updated' : 'created'
+            return `✅ **File ${action} Staged for Approval**\n\n**Path:** ${path}\n**Description:** ${description}\n**Lines:** ${content.split('\n').length}\n**Staging ID:** ${data.stagingId || 'N/A'}\n\n⚠️ This change is staged and will NOT go live until the user clicks "Approve & Publish".`
+          } else {
+            return `Failed to stage file write: ${data.message || 'Unknown error'}`
+          }
+        } catch (error) {
+          return `Error writing file "${path}": ${error instanceof Error ? error.message : 'Unknown error'}`
+        }
+      }
+
+      case 'edit_file': {
+        if (!isGitHubAvailable()) {
+          return 'Error: GitHub integration is not configured. Cannot edit files.'
+        }
+        const { path, oldContent, newContent, description } = toolInput as {
+          path: string
+          oldContent: string
+          newContent: string
+          description: string
+        }
+        try {
+          // Read the current file
+          const { content: currentContent, sha } = await getFileContent(path)
+
+          // Check if old content exists
+          if (!currentContent.includes(oldContent)) {
+            return `Error: Could not find the specified text in "${path}".\n\nThe text you're looking for:\n\`\`\`\n${oldContent}\n\`\`\`\n\nMake sure to use the exact text including whitespace. Use read_file first to see the current content.`
+          }
+
+          // Create the new content
+          const updatedContent = currentContent.replace(oldContent, newContent)
+
+          // Stage the edit operation
+          const response = await fetch(`${baseUrl}/api/website/file-operation`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              operation: 'edit',
+              path,
+              content: updatedContent,
+              sha,
+              description,
+              oldContent,
+              newContent,
+            }),
+          })
+
+          const data = await response.json()
+
+          if (data.success) {
+            return `✅ **File Edit Staged for Approval**\n\n**Path:** ${path}\n**Description:** ${description}\n**Staging ID:** ${data.stagingId || 'N/A'}\n\n**Change Preview:**\n- Removed: \`${oldContent.substring(0, 100)}${oldContent.length > 100 ? '...' : ''}\`\n- Added: \`${newContent.substring(0, 100)}${newContent.length > 100 ? '...' : ''}\`\n\n⚠️ This change is staged and will NOT go live until the user clicks "Approve & Publish".`
+          } else {
+            return `Failed to stage file edit: ${data.message || 'Unknown error'}`
+          }
+        } catch (error) {
+          return `Error editing file "${path}": ${error instanceof Error ? error.message : 'Unknown error'}`
+        }
+      }
+
+      case 'get_component_info': {
+        if (!isGitHubAvailable()) {
+          return 'Error: GitHub integration is not configured. Cannot analyze components.'
+        }
+        const { componentName } = toolInput as { componentName: string }
+        try {
+          // Search for the component definition
+          const matches = await searchInFiles(`function ${componentName}`)
+          const classMatches = await searchInFiles(`class ${componentName}`)
+          const exportMatches = await searchInFiles(`export default ${componentName}`)
+          const usageMatches = await searchInFiles(`<${componentName}`)
+
+          const allDefinitions = [...matches, ...classMatches]
+
+          let result = `## Component: ${componentName}\n\n`
+
+          if (allDefinitions.length === 0) {
+            result += `Component "${componentName}" not found in the codebase.\n\n`
+            result += `**Tip:** Try searching for variations like:\n`
+            result += `- "${componentName}Section"\n`
+            result += `- "${componentName}Component"\n`
+          } else {
+            result += `### Definition\n`
+            for (const def of allDefinitions.slice(0, 3)) {
+              result += `- **${def.path}:${def.line}** - \`${def.content}\`\n`
+            }
+            result += '\n'
+
+            if (usageMatches.length > 0) {
+              result += `### Usage (${usageMatches.length} locations)\n`
+              for (const usage of usageMatches.slice(0, 10)) {
+                result += `- **${usage.path}:${usage.line}** - \`${usage.content}\`\n`
+              }
+              if (usageMatches.length > 10) {
+                result += `- ... and ${usageMatches.length - 10} more\n`
+              }
+            }
+
+            // Read the component file to get props
+            if (allDefinitions[0]) {
+              try {
+                const { content } = await getFileContent(allDefinitions[0].path)
+
+                // Look for interface/type definitions
+                const propsMatch = content.match(/interface\s+\w*Props\s*\{([^}]+)\}/)
+                if (propsMatch) {
+                  result += `\n### Props\n\`\`\`typescript\ninterface Props {${propsMatch[1]}}\n\`\`\`\n`
+                }
+              } catch {
+                // Could not read file, skip props
+              }
+            }
+          }
+
+          return result
+        } catch (error) {
+          return `Error analyzing component: ${error instanceof Error ? error.message : 'Unknown error'}`
+        }
+      }
+
       default:
         return `Unknown tool: ${toolName}`
     }
@@ -298,36 +593,76 @@ export async function executeTool(
 // System prompt for the agentic assistant
 export const AGENTIC_SYSTEM_PROMPT = `You are an AI assistant for Nicole's Dance Center Elite (NDCE), a dance studio in Lutz, FL.
 
-You have access to tools that let you interact with the website. You should use these tools proactively to:
-1. Review the website to understand current content
-2. Search for specific text
-3. Preview changes before applying them
-4. Apply changes (which stages them for human approval)
+You have full access to the website codebase and can make any changes the user requests. Your tools include:
+
+## Content Tools (for text changes)
+- **review_website** - Crawl and analyze all website pages
+- **search_website** - Find specific text on the live site
+- **search_source_code** - Search the codebase for text
+- **preview_find_replace** - Preview what a text replacement would change
+- **apply_find_replace** - Stage a text replacement for approval
+
+## Advanced File Tools (for code changes)
+- **list_files** - Browse the project structure
+- **read_file** - Read any source file (ALWAYS read before editing)
+- **write_file** - Create a new file or replace an existing file
+- **edit_file** - Make targeted edits to specific parts of a file
+- **get_component_info** - Analyze a React component's structure and usage
 
 ## CRITICAL: Changes Are NOT Published Automatically
 
-**IMPORTANT:** When you use apply_find_replace, changes are STAGED, not published. They will NOT appear on the live website until the user manually clicks "Approve & Publish" in the admin panel.
+**IMPORTANT:** All file changes (apply_find_replace, write_file, edit_file) are STAGED for approval. They will NOT appear on the live website until the user manually clicks "Approve & Publish".
 
-NEVER tell the user that changes are "live", "published", "visible on the website", or "deployed" after using apply_find_replace. The correct language is:
+NEVER tell users changes are "live", "published", or "deployed". Always use:
 - "Changes have been STAGED for your approval"
-- "Changes are ready for review in the preview panel"
-- "Click 'Approve & Publish' in the admin panel to make changes live"
+- "Review changes in the preview panel"
+- "Click 'Approve & Publish' to make changes live"
 
-The staging system exists so users can review and edit changes before they go live. Without explicit approval, nothing changes on the live website.
+## How to Make Code Changes
 
-## Important Guidelines
+1. **Simple text updates** (phone numbers, ages, typos):
+   - Use search_website or search_source_code to find the text
+   - Use preview_find_replace to see all occurrences
+   - Use apply_find_replace to stage the change
 
-**Always review/search first:** Before making changes, use the review_website or search_website tools to understand the current state.
+2. **Add new content to existing pages**:
+   - Use list_files to find relevant files
+   - Use read_file to see the current code
+   - Use edit_file to add the new content at the right location
 
-**Preview before applying:** Always use preview_find_replace before apply_find_replace so the user can see what will change.
+3. **Create new components or pages**:
+   - Use get_component_info to understand similar components
+   - Use write_file to create the new file
+   - Use edit_file to import/use it where needed
 
-**Human-in-the-loop:** All changes are staged for approval. Always remind users that changes won't go live until they click "Approve & Publish" in the admin panel.
+4. **Modify component behavior**:
+   - Use read_file to understand the current implementation
+   - Use edit_file to make targeted changes
+   - Preserve the existing code style and patterns
 
-**Be thorough:** If the user has multiple requests, create a task list or handle them one by one, confirming each.
+## Best Practices
 
-**Use context:** Remember information from previous tool calls in this conversation. Don't re-review the website if you already have the info.
+- **Always read before editing**: Use read_file before edit_file to get exact text
+- **Make targeted edits**: Use edit_file for small changes, not write_file
+- **Preserve code style**: Match the existing indentation and formatting
+- **One change at a time**: Make small, focused changes that are easy to review
+- **Explain your changes**: Tell the user what you changed and why
 
-**Error handling:** If a tool call fails or returns no matches, explain the issue and suggest alternatives.
+## Project Structure (NDCE Website)
+
+\`\`\`
+src/
+  app/           # Next.js pages and layouts
+  components/    # React components (Header, Footer, etc.)
+  styles/        # CSS and styling
+  lib/           # Utilities and helpers
+\`\`\`
+
+Key components:
+- Header.tsx - Navigation and site header
+- Footer.tsx - Site footer with contact info
+- ContactSection.tsx - Contact form and info
+- ClassesSection.tsx - Dance class listings
 
 ## About NDCE
 - Family-oriented dance studio in Lutz, FL
@@ -335,7 +670,9 @@ The staging system exists so users can review and edit changes before they go li
 - Offers classes for ages 3+ through adults
 - Styles: Ballet, Tap, Jazz, Hip Hop, Lyrical, Contemporary, and more
 
-When you're done with a task:
-1. Summarize what changes were STAGED (not published)
-2. Remind the user to review changes in the preview panel
-3. Tell them to click "Approve & Publish" to make changes live on the website`
+## When You're Done
+
+1. Summarize what changes were STAGED
+2. List the files that were modified
+3. Remind the user to review in the preview panel
+4. Tell them to click "Approve & Publish" to deploy`
