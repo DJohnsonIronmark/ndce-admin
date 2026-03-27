@@ -1163,11 +1163,27 @@ Just tell me what you'd like to do, or upload some content to get started!`,
           totalFilesUpdated += result.filesUpdated || change.filesAffected || 0
           publishedItems.push(`Find & Replace: "${change.findText}" → "${finalReplaceText}"`)
         } else if (change.type === 'website_update') {
-          // Website updates - for now, just log success (would integrate with CMS API)
-          const finalContent = change.editedContent ?? change.content
-          publishedItems.push(`Website Update: ${change.section || 'content'} section`)
-          // TODO: Integrate with actual website update API
-          console.log('Publishing website update:', { section: change.section, content: finalContent })
+          // Publish file operation via GitHub
+          const commitMessage = change.description || `File update: ${change.section || 'website content'}`
+
+          const response = await fetch('/api/website/publish', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              action: 'publish',
+              stagingId: change.stagingId,
+              commitMessage,
+            }),
+          })
+
+          const result = await response.json()
+          if (!result.success) {
+            allSuccess = false
+            console.error('Failed to publish website update:', result.message)
+            break
+          }
+          totalFilesUpdated += result.filesUpdated || 1
+          publishedItems.push(`Website Update: ${change.section || change.description || 'file update'}`)
         } else if (change.type === 'social_post') {
           // Social posts - for now, just log success (would integrate with social API)
           const finalCaption = change.editedCaption ?? change.caption

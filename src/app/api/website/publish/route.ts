@@ -2,8 +2,8 @@ import { NextRequest, NextResponse } from 'next/server'
 import { exec } from 'child_process'
 import { promisify } from 'util'
 import { access } from 'fs/promises'
-import { commitStagedChanges } from '@/lib/github'
-import { getStagedChanges, getAllPendingChanges, updateStagedStatus, removeStagedChanges } from '@/lib/github-staging'
+import { commitStagedChanges, updateFile, getFileContent } from '@/lib/github'
+import { getStagedChanges, getAllPendingChanges, updateStagedStatus, removeStagedChanges, getGenericStagedChange, updateGenericStagedStatus, removeGenericStagedChange } from '@/lib/github-staging'
 
 const execAsync = promisify(exec)
 
@@ -63,9 +63,13 @@ export async function POST(request: NextRequest) {
           })
         }
 
-        // Get the staged changes
+        // Try to get find_replace staged changes first
         const staged = getStagedChanges(stagingId)
-        if (!staged) {
+
+        // If not found, try generic staged changes (file operations)
+        const genericStaged = !staged ? getGenericStagedChange(stagingId) : null
+
+        if (!staged && !genericStaged) {
           return NextResponse.json({
             success: false,
             message: 'Staged changes not found or expired. Please apply changes again.',
@@ -73,45 +77,116 @@ export async function POST(request: NextRequest) {
           })
         }
 
-        if (staged.status !== 'pending') {
+        // Handle generic file operations (write_file, edit_file)
+        if (genericStaged) {
+          if (genericStaged.status !== 'pending') {
+            return NextResponse.json({
+              success: false,
+              message: `These changes have already been ${genericStaged.status}.`,
+              mode: 'github',
+            })
+          }
+
+          const message = commitMessage || genericStaged.description || 'Website update via assistant'
+
+          try {
+            // For file operations, we need to get fresh SHA and commit
+            if (genericStaged.type === 'file_write' || genericStaged.type === 'file_edit') {
+              // Get fresh SHA to avoid conflicts
+              let sha = genericStaged.sha
+              try {
+                const fresh = await getFileContent(genericStaged.path!)
+                sha = fresh.sha
+              } catch {
+                // File might be new, continue without SHA
+                sha = undefined
+              }
+
+              const result = await updateFile(
+                genericStaged.path!,
+                genericStaged.content!,
+                sha || '',
+                message
+              )
+
+              if (result.success) {
+                updateGenericStagedStatus(stagingId, 'approved')
+                removeGenericStagedChange(stagingId)
+
+                return NextResponse.json({
+                  success: true,
+                  action: 'published',
+                  filesUpdated: 1,
+                  totalFiles: 1,
+                  message: `Successfully published file update to ${genericStaged.path}. Deployment will begin shortly.`,
+                  deployUrl: 'https://ndce-platform.vercel.app',
+                  mode: 'github',
+                })
+              } else {
+                return NextResponse.json({
+                  success: false,
+                  message: `Failed to publish: ${result.error}`,
+                  mode: 'github',
+                })
+              }
+            }
+          } catch (error) {
+            return NextResponse.json({
+              success: false,
+              message: `Error publishing file: ${error instanceof Error ? error.message : 'Unknown error'}`,
+              mode: 'github',
+            })
+          }
+        }
+
+        // Handle find_replace staged changes
+        if (staged) {
+          if (staged.status !== 'pending') {
+            return NextResponse.json({
+              success: false,
+              message: `These changes have already been ${staged.status}.`,
+              mode: 'github',
+            })
+          }
+
+          // Commit the staged changes to GitHub
+          const message = commitMessage || `Website update: Replace "${staged.findText}" with "${staged.replaceText}" (${staged.matchCount} occurrences)`
+
+          const results = await commitStagedChanges(
+            staged.files.map(f => ({
+              path: f.path,
+              newContent: f.newContent,
+              sha: f.sha,
+            })),
+            message
+          )
+
+          const successCount = results.filter(r => r.success).length
+          const failedResults = results.filter(r => !r.success)
+
+          if (successCount > 0) {
+            updateStagedStatus(stagingId, 'approved')
+            removeStagedChanges(stagingId)
+          }
+
           return NextResponse.json({
-            success: false,
-            message: `These changes have already been ${staged.status}.`,
+            success: successCount > 0,
+            action: 'published',
+            filesUpdated: successCount,
+            totalFiles: staged.files.length,
+            matchCount: staged.matchCount,
+            errors: failedResults.length > 0 ? failedResults : undefined,
+            message: successCount === staged.files.length
+              ? `Successfully published ${staged.matchCount} change(s) across ${successCount} file(s). Deployment will begin shortly.`
+              : `Published ${successCount} of ${staged.files.length} files. Some files failed to update.`,
+            deployUrl: 'https://ndce-platform.vercel.app',
             mode: 'github',
           })
         }
 
-        // Commit the staged changes to GitHub
-        const message = commitMessage || `Website update: Replace "${staged.findText}" with "${staged.replaceText}" (${staged.matchCount} occurrences)`
-
-        const results = await commitStagedChanges(
-          staged.files.map(f => ({
-            path: f.path,
-            newContent: f.newContent,
-            sha: f.sha,
-          })),
-          message
-        )
-
-        const successCount = results.filter(r => r.success).length
-        const failedResults = results.filter(r => !r.success)
-
-        if (successCount > 0) {
-          updateStagedStatus(stagingId, 'approved')
-          removeStagedChanges(stagingId)
-        }
-
         return NextResponse.json({
-          success: successCount > 0,
-          action: 'published',
-          filesUpdated: successCount,
-          totalFiles: staged.files.length,
-          matchCount: staged.matchCount,
-          errors: failedResults.length > 0 ? failedResults : undefined,
-          message: successCount === staged.files.length
-            ? `Successfully published ${staged.matchCount} change(s) across ${successCount} file(s). Deployment will begin shortly.`
-            : `Published ${successCount} of ${staged.files.length} files. Some files failed to update.`,
-          deployUrl: 'https://ndce-platform.vercel.app',
+          success: false,
+          message: 'No valid staged changes found',
           mode: 'github',
         })
 
