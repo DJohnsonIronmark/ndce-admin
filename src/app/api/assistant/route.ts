@@ -7,7 +7,7 @@ const anthropic = new Anthropic({
 })
 
 // Maximum number of agentic turns to prevent infinite loops
-const MAX_TURNS = 10
+const MAX_TURNS = 15
 
 interface ChatMessage {
   role: 'user' | 'assistant'
@@ -212,6 +212,12 @@ export async function POST(request: NextRequest) {
         role: 'user',
         content: toolResultsForMessage,
       })
+    }
+
+    // Generate fallback response if empty but we have staged changes
+    if (!finalResponse && stagedChanges.length > 0) {
+      const changeDescriptions = stagedChanges.map(c => `- ${c.description}`).join('\n')
+      finalResponse = `I've staged the following changes for your approval:\n\n${changeDescriptions}\n\nPlease review the changes in the preview panel and click "Approve & Publish" when ready.`
     }
 
     // Build response

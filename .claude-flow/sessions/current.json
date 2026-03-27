@@ -1,10 +1,10 @@
 {
-  "id": "session-1774571709053",
-  "startedAt": "2026-03-27T00:35:09.053Z",
+  "id": "session-1774616677810",
+  "startedAt": "2026-03-27T13:04:37.810Z",
   "cwd": "/Users/drewjohnson/nicoles-dance-center/admin",
   "context": {},
   "metrics": {
-    "edits": 29,
+    "edits": 2,
     "commands": 0,
     "tasks": 0,
     "errors": 0
