@@ -19,6 +19,22 @@ interface AssistantRequest {
   history?: ChatMessage[]
 }
 
+interface StagedChangeFromTool {
+  id: string
+  type: 'find_replace' | 'website_update' | 'social_post'
+  title: string
+  description: string
+  findText?: string
+  replaceText?: string
+  matchCount?: number
+  filesAffected?: number
+  stagingId?: string
+  section?: string
+  content?: string
+  platforms?: string[]
+  caption?: string
+}
+
 // Use types from Anthropic SDK
 type ContentBlock = Anthropic.ContentBlock
 type ToolUseBlock = Anthropic.ToolUseBlock
@@ -70,6 +86,7 @@ export async function POST(request: NextRequest) {
     const toolResults: Array<{ name: string; input: unknown; result: string }> = []
     let finalResponse = ''
     let taskList: unknown = null
+    const stagedChanges: StagedChangeFromTool[] = []
 
     while (turn < MAX_TURNS) {
       turn++
@@ -119,6 +136,27 @@ export async function POST(request: NextRequest) {
           }
         }
 
+        // Check if this is a staged change from apply_find_replace
+        if (toolUse.name === 'apply_find_replace' && result.includes('Changes Staged')) {
+          const input = toolUse.input as { findText?: string; replaceText?: string }
+          // Extract staging info from result
+          const stagingIdMatch = result.match(/Staging ID:\s*(\S+)/)
+          const matchCountMatch = result.match(/Replaced (\d+) occurrence/)
+          const filesMatch = result.match(/in (\d+) file/)
+
+          stagedChanges.push({
+            id: `staged-${Date.now()}-${stagedChanges.length}`,
+            type: 'find_replace',
+            title: 'Find & Replace',
+            description: `Replace "${input.findText}" with "${input.replaceText || '(remove)'}"`,
+            findText: input.findText,
+            replaceText: input.replaceText || '',
+            matchCount: matchCountMatch ? parseInt(matchCountMatch[1]) : 0,
+            filesAffected: filesMatch ? parseInt(filesMatch[1]) : 0,
+            stagingId: stagingIdMatch ? stagingIdMatch[1] : '',
+          })
+        }
+
         toolResults.push({
           name: toolUse.name,
           input: toolUse.input,
@@ -151,6 +189,7 @@ export async function POST(request: NextRequest) {
       toolsUsed: toolResults.map(t => ({ name: t.name, input: t.input })),
       turns: turn,
       taskList: taskList,
+      stagedChanges: stagedChanges.length > 0 ? stagedChanges : null,
     })
 
   } catch (error) {

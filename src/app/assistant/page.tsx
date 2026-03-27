@@ -188,6 +188,44 @@ Just tell me what you'd like to do, or upload some content to get started!`,
           setTaskList(result.taskList)
         }
 
+        // Handle staged changes from assistant tools
+        if (result.stagedChanges && result.stagedChanges.length > 0) {
+          setStagedChanges(prev => [
+            ...prev,
+            ...result.stagedChanges.map((sc: {
+              id: string
+              type: 'find_replace' | 'website_update' | 'social_post'
+              title: string
+              description: string
+              findText?: string
+              replaceText?: string
+              matchCount?: number
+              filesAffected?: number
+              stagingId?: string
+              section?: string
+              content?: string
+              platforms?: string[]
+              caption?: string
+            }) => ({
+              id: sc.id,
+              suggestionId: sc.id,
+              messageId: 'assistant-tool',
+              type: sc.type,
+              title: sc.title,
+              description: sc.description,
+              findText: sc.findText,
+              replaceText: sc.replaceText,
+              matchCount: sc.matchCount,
+              filesAffected: sc.filesAffected,
+              stagingId: sc.stagingId || '',
+              section: sc.section,
+              content: sc.content,
+              platforms: sc.platforms,
+              caption: sc.caption,
+            }))
+          ])
+        }
+
         setIsLoading(false)
         return
       }
