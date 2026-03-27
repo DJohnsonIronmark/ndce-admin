@@ -1164,7 +1164,9 @@ Just tell me what you'd like to do, or upload some content to get started!`,
           publishedItems.push(`Find & Replace: "${change.findText}" → "${finalReplaceText}"`)
         } else if (change.type === 'website_update') {
           // Publish file operation via GitHub
+          // Send content directly to bypass in-memory staging (which doesn't work in serverless)
           const commitMessage = change.description || `File update: ${change.section || 'website content'}`
+          const finalContent = change.editedContent ?? change.content
 
           const response = await fetch('/api/website/publish', {
             method: 'POST',
@@ -1173,6 +1175,8 @@ Just tell me what you'd like to do, or upload some content to get started!`,
               action: 'publish',
               stagingId: change.stagingId,
               commitMessage,
+              path: change.section,  // section contains the file path
+              content: finalContent,  // send content directly
             }),
           })
 

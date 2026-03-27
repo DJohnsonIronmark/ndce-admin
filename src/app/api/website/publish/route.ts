@@ -13,6 +13,10 @@ interface PublishRequest {
   action: 'publish' | 'rollback' | 'status'
   commitMessage?: string
   stagingId?: string  // Required for GitHub mode publish/rollback
+  // Direct content for publishing (bypasses in-memory staging)
+  path?: string
+  content?: string
+  sha?: string
 }
 
 // Check if local filesystem is available
@@ -28,7 +32,7 @@ async function isLocalAvailable(): Promise<boolean> {
 export async function POST(request: NextRequest) {
   try {
     const body: PublishRequest = await request.json()
-    const { action, commitMessage, stagingId } = body
+    const { action, commitMessage, stagingId, path, content, sha } = body
 
     // Check if we're in local mode
     const localAvailable = await isLocalAvailable()
@@ -36,6 +40,55 @@ export async function POST(request: NextRequest) {
     if (!localAvailable) {
       // GitHub mode - handle staged changes approval
       if (action === 'publish') {
+        // DIRECT CONTENT MODE: If path and content are provided, commit directly
+        // This bypasses in-memory staging which doesn't work in serverless
+        if (path && content) {
+          const message = commitMessage || `Website update: ${path.split('/').pop()}`
+
+          try {
+            // Get fresh SHA to avoid conflicts
+            let currentSha = sha
+            try {
+              const fresh = await getFileContent(path)
+              currentSha = fresh.sha
+            } catch {
+              // File might be new, continue without SHA
+              currentSha = undefined
+            }
+
+            const result = await updateFile(
+              path,
+              content,
+              currentSha || '',
+              message
+            )
+
+            if (result.success) {
+              return NextResponse.json({
+                success: true,
+                action: 'published',
+                filesUpdated: 1,
+                totalFiles: 1,
+                message: `Successfully published update to ${path}. Deployment will begin shortly.`,
+                deployUrl: 'https://ndce-platform.vercel.app',
+                mode: 'github-direct',
+              })
+            } else {
+              return NextResponse.json({
+                success: false,
+                message: `Failed to publish: ${result.error}`,
+                mode: 'github-direct',
+              })
+            }
+          } catch (error) {
+            return NextResponse.json({
+              success: false,
+              message: `Error publishing file: ${error instanceof Error ? error.message : 'Unknown error'}`,
+              mode: 'github-direct',
+            })
+          }
+        }
+
         if (!stagingId) {
           // Check if there are any pending changes
           const pendingChanges = getAllPendingChanges()

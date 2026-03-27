@@ -325,7 +325,7 @@ export async function executeTool(
         if (data.matchCount === 0) {
           return `No matches found for "${findText}". No changes were made.`
         }
-        return `✅ **Changes Staged for Approval**\n\nReplaced ${data.matchCount} occurrence(s) in ${data.filesAffected} file(s).\n\n**Staging ID:** ${data.stagingId || 'N/A'}\n\n⚠️ These changes are staged and will NOT go live until the user clicks "Approve & Publish".`
+        return `✅ **Find & Replace - STAGED (NOT LIVE)**\n\nReplaced ${data.matchCount} occurrence(s) in ${data.filesAffected} file(s).\n\n**Staging ID:** ${data.stagingId || 'N/A'}\n\n⚠️ **IMPORTANT:** These changes are in the staging area only. They will NOT appear on the website until the user clicks "Approve & Publish" in the right panel.\n\n📋 Tell the user: "I've staged these changes. Please click 'Approve & Publish' to make them live."`
       }
 
       case 'search_source_code': {
@@ -464,7 +464,7 @@ export async function executeTool(
 
           if (data.success) {
             const action = sha ? 'updated' : 'created'
-            return `✅ **File ${action} Staged for Approval**\n\n**Path:** ${path}\n**Description:** ${description}\n**Lines:** ${content.split('\n').length}\n**Staging ID:** ${data.stagingId || 'N/A'}\n\n⚠️ This change is staged and will NOT go live until the user clicks "Approve & Publish".`
+            return `✅ **File ${action} - STAGED (NOT LIVE)**\n\n**Path:** ${path}\n**Description:** ${description}\n**Lines:** ${content.split('\n').length}\n**Staging ID:** ${data.stagingId || 'N/A'}\n\n⚠️ **IMPORTANT:** This change is in the staging area only. It will NOT appear on the website until the user clicks "Approve & Publish" in the right panel.\n\n📋 Tell the user: "I've staged these changes. Please click 'Approve & Publish' to make them live."`
           } else {
             return `Failed to stage file write: ${data.message || 'Unknown error'}`
           }
@@ -513,7 +513,7 @@ export async function executeTool(
           const data = await response.json()
 
           if (data.success) {
-            return `✅ **File Edit Staged for Approval**\n\n**Path:** ${path}\n**Description:** ${description}\n**Staging ID:** ${data.stagingId || 'N/A'}\n\n**Change Preview:**\n- Removed: \`${oldContent.substring(0, 100)}${oldContent.length > 100 ? '...' : ''}\`\n- Added: \`${newContent.substring(0, 100)}${newContent.length > 100 ? '...' : ''}\`\n\n⚠️ This change is staged and will NOT go live until the user clicks "Approve & Publish".`
+            return `✅ **File Edit - STAGED (NOT LIVE)**\n\n**Path:** ${path}\n**Description:** ${description}\n**Staging ID:** ${data.stagingId || 'N/A'}\n\n**Change Preview:**\n- Removed: \`${oldContent.substring(0, 100)}${oldContent.length > 100 ? '...' : ''}\`\n- Added: \`${newContent.substring(0, 100)}${newContent.length > 100 ? '...' : ''}\`\n\n⚠️ **IMPORTANT:** This change is in the staging area only. It will NOT appear on the website until the user clicks "Approve & Publish" in the right panel.\n\n📋 Tell the user: "I've staged these changes. Please click 'Approve & Publish' to make them live."`
           } else {
             return `Failed to stage file edit: ${data.message || 'Unknown error'}`
           }
@@ -609,14 +609,28 @@ You have full access to the website codebase and can make any changes the user r
 - **edit_file** - Make targeted edits to specific parts of a file
 - **get_component_info** - Analyze a React component's structure and usage
 
-## CRITICAL: Changes Are NOT Published Automatically
+## ⛔ CRITICAL RULE - READ THIS CAREFULLY ⛔
 
-**IMPORTANT:** All file changes (apply_find_replace, write_file, edit_file) are STAGED for approval. They will NOT appear on the live website until the user manually clicks "Approve & Publish".
+**CHANGES ARE NEVER AUTOMATICALLY LIVE.**
 
-NEVER tell users changes are "live", "published", or "deployed". Always use:
-- "Changes have been STAGED for your approval"
-- "Review changes in the preview panel"
-- "Click 'Approve & Publish' to make changes live"
+When you use write_file, edit_file, or apply_find_replace:
+1. Changes go to a STAGING area only
+2. They do NOT appear on the live website
+3. The user MUST manually approve and publish
+
+**YOU MUST NEVER SAY:**
+- ❌ "Changes are now live"
+- ❌ "Published successfully"
+- ❌ "The changes are deployed"
+- ❌ "Your website has been updated"
+- ❌ Any variation suggesting changes are visible on the site
+
+**YOU MUST ALWAYS SAY:**
+- ✅ "I've STAGED these changes for your review"
+- ✅ "Click 'Approve & Publish' in the panel on the right to make these live"
+- ✅ "The changes are ready for your approval but NOT yet on the website"
+
+This is extremely important - users get confused when told something is live but they can't see it.
 
 ## How to Make Code Changes
 
@@ -670,9 +684,20 @@ Key components:
 - Offers classes for ages 3+ through adults
 - Styles: Ballet, Tap, Jazz, Hip Hop, Lyrical, Contemporary, and more
 
-## When You're Done
+## When You're Done (FOLLOW THIS EXACTLY)
 
-1. Summarize what changes were STAGED
-2. List the files that were modified
-3. Remind the user to review in the preview panel
-4. Tell them to click "Approve & Publish" to deploy`
+After making changes with write_file, edit_file, or apply_find_replace, ALWAYS end with this format:
+
+"I've **STAGED** the following changes for your review:
+- [List each file modified]
+
+⚠️ **These changes are NOT live yet.** They are in the staging area waiting for your approval.
+
+👉 **Next step:** Click the **'Approve & Publish'** button in the panel on the right to make these changes live on your website."
+
+⛔ **NEVER say:**
+- "Changes are live" or "published" or "deployed"
+- "Your website has been updated"
+- The rocket emoji 🚀 with claims of publishing
+
+The user MUST click "Approve & Publish" - until then, nothing has changed on the actual website.`
