@@ -139,8 +139,8 @@ export async function POST(request: NextRequest) {
         // Check if this is a staged change from apply_find_replace
         if (toolUse.name === 'apply_find_replace' && result.includes('Changes Staged')) {
           const input = toolUse.input as { findText?: string; replaceText?: string }
-          // Extract staging info from result
-          const stagingIdMatch = result.match(/Staging ID:\s*(\S+)/)
+          // Extract staging info from result (handles markdown formatting like **Staging ID:**)
+          const stagingIdMatch = result.match(/\*?\*?Staging ID:\*?\*?\s*(staged_\S+)/)
           const matchCountMatch = result.match(/Replaced (\d+) occurrence/)
           const filesMatch = result.match(/in (\d+) file/)
 
@@ -160,7 +160,7 @@ export async function POST(request: NextRequest) {
         // Check if this is a staged file write
         if (toolUse.name === 'write_file' && result.includes('Staged for Approval')) {
           const input = toolUse.input as { path?: string; description?: string; content?: string }
-          const stagingIdMatch = result.match(/Staging ID:\s*(\S+)/)
+          const stagingIdMatch = result.match(/\*?\*?Staging ID:\*?\*?\s*(file-\S+)/)
 
           stagedChanges.push({
             id: `staged-${Date.now()}-${stagedChanges.length}`,
@@ -176,7 +176,7 @@ export async function POST(request: NextRequest) {
         // Check if this is a staged file edit
         if (toolUse.name === 'edit_file' && result.includes('Staged for Approval')) {
           const input = toolUse.input as { path?: string; description?: string; oldContent?: string; newContent?: string }
-          const stagingIdMatch = result.match(/Staging ID:\s*(\S+)/)
+          const stagingIdMatch = result.match(/\*?\*?Staging ID:\*?\*?\s*(file-\S+)/)
 
           stagedChanges.push({
             id: `staged-${Date.now()}-${stagedChanges.length}`,
