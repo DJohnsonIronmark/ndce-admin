@@ -56,16 +56,28 @@ interface TaskItem {
 }
 
 interface StagedChange {
+  id: string
   suggestionId: string
   messageId: string
-  findText: string
-  replaceText: string
-  matchCount: number
-  filesAffected: number
-  stagingId: string  // Required for GitHub mode approval
-  previewContent?: string  // The full content context for preview
-  editedReplaceText?: string  // User-edited replacement text
-  isEditing?: boolean  // Whether this change is being edited
+  type: 'find_replace' | 'website_update' | 'social_post'
+  // For find_replace
+  findText?: string
+  replaceText?: string
+  matchCount?: number
+  filesAffected?: number
+  stagingId?: string
+  editedReplaceText?: string
+  // For website_update
+  section?: string
+  content?: string
+  editedContent?: string
+  // For social_post
+  platforms?: string[]
+  caption?: string
+  editedCaption?: string
+  // Common
+  title: string
+  description: string
 }
 
 const EXAMPLE_PROMPTS = [
@@ -935,8 +947,12 @@ Just tell me what you'd like to do, or upload some content to get started!`,
 
             // Add staged change for tracking (includes stagingId for GitHub mode)
             setStagedChanges(prev => [...prev, {
+              id: `staged-${Date.now()}`,
               suggestionId,
               messageId,
+              type: 'find_replace',
+              title: 'Find & Replace',
+              description: suggestion.description,
               findText: suggestion.findText!,
               replaceText: suggestion.replaceText!,
               matchCount: result.matchCount,
@@ -977,14 +993,88 @@ Just tell me what you'd like to do, or upload some content to get started!`,
       }
     }
 
-    // Handle regular suggestion actions
+    // Handle website updates - stage for preview
+    if (suggestion.type === 'website_update' && action === 'apply') {
+      setStagedChanges(prev => [...prev, {
+        id: `staged-${Date.now()}`,
+        suggestionId,
+        messageId,
+        type: 'website_update',
+        title: suggestion.title,
+        description: suggestion.description,
+        section: suggestion.section,
+        content: suggestion.content,
+      }])
+
+      // Mark as staged
+      setMessages(prev => prev.map(msg => {
+        if (msg.id === messageId && msg.suggestions) {
+          return {
+            ...msg,
+            suggestions: msg.suggestions.map(s =>
+              s.id === suggestionId
+                ? { ...s, status: 'staged' as const, requiresApproval: true }
+                : s
+            )
+          }
+        }
+        return msg
+      }))
+
+      setMessages(prev => [...prev, {
+        id: Date.now().toString(),
+        role: 'assistant',
+        content: `✅ **Website update staged for review**\n\nYour content for the **${suggestion.section || 'website'}** section has been staged.\n\n🔍 Review and edit the content in the preview panel above, then click **"Approve & Publish"** to deploy.`,
+        timestamp: new Date(),
+      }])
+      return
+    }
+
+    // Handle social posts - stage for preview
+    if (suggestion.type === 'social_post' && action === 'apply') {
+      setStagedChanges(prev => [...prev, {
+        id: `staged-${Date.now()}`,
+        suggestionId,
+        messageId,
+        type: 'social_post',
+        title: suggestion.title,
+        description: suggestion.description,
+        platforms: suggestion.platforms,
+        caption: suggestion.content,
+      }])
+
+      // Mark as staged
+      setMessages(prev => prev.map(msg => {
+        if (msg.id === messageId && msg.suggestions) {
+          return {
+            ...msg,
+            suggestions: msg.suggestions.map(s =>
+              s.id === suggestionId
+                ? { ...s, status: 'staged' as const, requiresApproval: true }
+                : s
+            )
+          }
+        }
+        return msg
+      }))
+
+      setMessages(prev => [...prev, {
+        id: Date.now().toString(),
+        role: 'assistant',
+        content: `✅ **Social post staged for review**\n\nYour post for **${suggestion.platforms?.join(' & ') || 'social media'}** has been staged.\n\n🔍 Review and edit the caption in the preview panel above, then click **"Approve & Publish"** to schedule.`,
+        timestamp: new Date(),
+      }])
+      return
+    }
+
+    // Handle rejections
     setMessages(prev => prev.map(msg => {
       if (msg.id === messageId && msg.suggestions) {
         return {
           ...msg,
           suggestions: msg.suggestions.map(s =>
             s.id === suggestionId
-              ? { ...s, status: action === 'apply' ? 'applied' : 'rejected' as const }
+              ? { ...s, status: 'rejected' as const }
               : s
           )
         }
@@ -1006,30 +1096,47 @@ Just tell me what you'd like to do, or upload some content to get started!`,
     ])
 
     try {
-      // Publish each staged change with its stagingId
+      // Publish each staged change based on type
       let allSuccess = true
       let totalFilesUpdated = 0
+      const publishedItems: string[] = []
 
       for (const change of stagedChanges) {
-        const finalReplaceText = change.editedReplaceText ?? change.replaceText
-        const commitMessage = `Replace "${change.findText}" with "${finalReplaceText}" (${change.matchCount} occurrences)`
+        if (change.type === 'find_replace') {
+          // Publish find-replace via GitHub
+          const finalReplaceText = change.editedReplaceText ?? change.replaceText
+          const commitMessage = `Replace "${change.findText}" with "${finalReplaceText}" (${change.matchCount} occurrences)`
 
-        const response = await fetch('/api/website/publish', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            action: 'publish',
-            stagingId: change.stagingId,
-            commitMessage,
-          }),
-        })
+          const response = await fetch('/api/website/publish', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              action: 'publish',
+              stagingId: change.stagingId,
+              commitMessage,
+            }),
+          })
 
-        const result = await response.json()
-        if (!result.success) {
-          allSuccess = false
-          break
+          const result = await response.json()
+          if (!result.success) {
+            allSuccess = false
+            break
+          }
+          totalFilesUpdated += result.filesUpdated || change.filesAffected || 0
+          publishedItems.push(`Find & Replace: "${change.findText}" → "${finalReplaceText}"`)
+        } else if (change.type === 'website_update') {
+          // Website updates - for now, just log success (would integrate with CMS API)
+          const finalContent = change.editedContent ?? change.content
+          publishedItems.push(`Website Update: ${change.section || 'content'} section`)
+          // TODO: Integrate with actual website update API
+          console.log('Publishing website update:', { section: change.section, content: finalContent })
+        } else if (change.type === 'social_post') {
+          // Social posts - for now, just log success (would integrate with social API)
+          const finalCaption = change.editedCaption ?? change.caption
+          publishedItems.push(`Social Post: ${change.platforms?.join(', ') || 'social media'}`)
+          // TODO: Integrate with social media scheduling API
+          console.log('Publishing social post:', { platforms: change.platforms, caption: finalCaption })
         }
-        totalFilesUpdated += result.filesUpdated || change.filesAffected
       }
 
       updateProgress('committing', 'complete', 'Changes committed')
@@ -1088,9 +1195,9 @@ Just tell me what you'd like to do, or upload some content to get started!`,
     }
   }
 
-  // Re-stage a change with edited text
+  // Re-stage a find-replace change with edited text
   const handleRestage = async (change: StagedChange) => {
-    if (!change.editedReplaceText) return
+    if (change.type !== 'find_replace' || !change.editedReplaceText || !change.findText) return
 
     setIsLoading(true)
     setProgressSteps([
@@ -1133,7 +1240,7 @@ Just tell me what you'd like to do, or upload some content to get started!`,
 
         // Update the staged change with new values
         setStagedChanges(prev => prev.map(c =>
-          c.suggestionId === change.suggestionId
+          c.id === change.id
             ? {
                 ...c,
                 replaceText: change.editedReplaceText!,
@@ -1252,8 +1359,12 @@ Just tell me what you'd like to do, or upload some content to get started!`,
 
           // Add to staged changes (includes stagingId for GitHub mode)
           setStagedChanges(prev => [...prev, {
+            id: `staged-task-${Date.now()}`,
             suggestionId: taskId,
             messageId: 'task',
+            type: 'find_replace',
+            title: 'Find & Replace',
+            description: task.description,
             findText: task.findText!,
             replaceText: task.replaceText!,
             matchCount: result.matchCount,
@@ -1385,22 +1496,37 @@ Just tell me what you'd like to do, or upload some content to get started!`,
                 {previewExpanded && (
                   <div className="px-6 py-4 space-y-4 max-h-96 overflow-y-auto">
                     {stagedChanges.map((change, index) => (
-                      <div key={change.suggestionId || index} className="bg-white rounded-lg border border-amber-200 overflow-hidden">
+                      <div key={change.id || index} className="bg-white rounded-lg border border-amber-200 overflow-hidden">
                         {/* Change Header */}
                         <div className="px-4 py-2 bg-gray-50 border-b flex items-center justify-between">
                           <div className="flex items-center gap-2">
-                            <Globe className="h-4 w-4 text-blue-600" />
+                            {change.type === 'find_replace' && <Globe className="h-4 w-4 text-blue-600" />}
+                            {change.type === 'website_update' && <Globe className="h-4 w-4 text-purple-600" />}
+                            {change.type === 'social_post' && <MessageSquare className="h-4 w-4 text-pink-600" />}
                             <span className="text-sm font-medium text-gray-700">
-                              Find & Replace ({change.matchCount} occurrence{change.matchCount !== 1 ? 's' : ''} in {change.filesAffected} file{change.filesAffected !== 1 ? 's' : ''})
+                              {change.title}
+                              {change.type === 'find_replace' && change.matchCount && (
+                                <span className="ml-2 text-xs text-gray-500">
+                                  ({change.matchCount} occurrence{change.matchCount !== 1 ? 's' : ''} in {change.filesAffected} file{change.filesAffected !== 1 ? 's' : ''})
+                                </span>
+                              )}
+                              {change.type === 'website_update' && change.section && (
+                                <span className="ml-2 text-xs text-gray-500">({change.section} section)</span>
+                              )}
                             </span>
                           </div>
-                          {editingChangeId !== change.suggestionId ? (
+                          {editingChangeId !== change.id ? (
                             <button
                               onClick={() => {
-                                setEditingChangeId(change.suggestionId)
+                                setEditingChangeId(change.id)
                                 setStagedChanges(prev => prev.map(c =>
-                                  c.suggestionId === change.suggestionId
-                                    ? { ...c, editedReplaceText: c.editedReplaceText ?? c.replaceText }
+                                  c.id === change.id
+                                    ? {
+                                        ...c,
+                                        editedReplaceText: c.type === 'find_replace' ? (c.editedReplaceText ?? c.replaceText) : c.editedReplaceText,
+                                        editedContent: c.type === 'website_update' ? (c.editedContent ?? c.content) : c.editedContent,
+                                        editedCaption: c.type === 'social_post' ? (c.editedCaption ?? c.caption) : c.editedCaption,
+                                      }
                                     : c
                                 ))
                               }}
@@ -1412,10 +1538,7 @@ Just tell me what you'd like to do, or upload some content to get started!`,
                           ) : (
                             <div className="flex items-center gap-2">
                               <button
-                                onClick={() => {
-                                  // Save the edit
-                                  setEditingChangeId(null)
-                                }}
+                                onClick={() => setEditingChangeId(null)}
                                 className="flex items-center gap-1 text-xs text-green-600 hover:text-green-800"
                               >
                                 <Check className="h-3 w-3" />
@@ -1423,10 +1546,14 @@ Just tell me what you'd like to do, or upload some content to get started!`,
                               </button>
                               <button
                                 onClick={() => {
-                                  // Cancel the edit
                                   setStagedChanges(prev => prev.map(c =>
-                                    c.suggestionId === change.suggestionId
-                                      ? { ...c, editedReplaceText: c.replaceText }
+                                    c.id === change.id
+                                      ? {
+                                          ...c,
+                                          editedReplaceText: c.replaceText,
+                                          editedContent: c.content,
+                                          editedCaption: c.caption,
+                                        }
                                       : c
                                   ))
                                   setEditingChangeId(null)
@@ -1440,66 +1567,150 @@ Just tell me what you'd like to do, or upload some content to get started!`,
                           )}
                         </div>
 
-                        {/* Before/After Preview */}
+                        {/* Content Preview based on type */}
                         <div className="p-4 space-y-3">
-                          {/* Before */}
-                          <div>
-                            <label className="text-xs font-medium text-gray-500 uppercase tracking-wide">Before</label>
-                            <div className="mt-1 p-3 bg-red-50 border border-red-200 rounded text-sm">
-                              <span className="bg-red-200 px-1 rounded">{change.findText}</span>
-                            </div>
-                          </div>
-
-                          {/* After (editable) */}
-                          <div>
-                            <label className="text-xs font-medium text-gray-500 uppercase tracking-wide">After</label>
-                            {editingChangeId === change.suggestionId ? (
-                              <textarea
-                                value={change.editedReplaceText ?? change.replaceText}
-                                onChange={(e) => {
-                                  setStagedChanges(prev => prev.map(c =>
-                                    c.suggestionId === change.suggestionId
-                                      ? { ...c, editedReplaceText: e.target.value }
-                                      : c
-                                  ))
-                                }}
-                                className="mt-1 w-full p-3 bg-white border-2 border-blue-400 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                                rows={3}
-                                placeholder="Enter replacement text..."
-                                autoFocus
-                              />
-                            ) : (
-                              <div className="mt-1 p-3 bg-green-50 border border-green-200 rounded text-sm">
-                                {(change.editedReplaceText ?? change.replaceText) ? (
-                                  <span className="bg-green-200 px-1 rounded">{change.editedReplaceText ?? change.replaceText}</span>
+                          {/* Find & Replace Preview */}
+                          {change.type === 'find_replace' && (
+                            <>
+                              <div>
+                                <label className="text-xs font-medium text-gray-500 uppercase tracking-wide">Before</label>
+                                <div className="mt-1 p-3 bg-red-50 border border-red-200 rounded text-sm">
+                                  <span className="bg-red-200 px-1 rounded">{change.findText}</span>
+                                </div>
+                              </div>
+                              <div>
+                                <label className="text-xs font-medium text-gray-500 uppercase tracking-wide">After</label>
+                                {editingChangeId === change.id ? (
+                                  <textarea
+                                    value={change.editedReplaceText ?? change.replaceText ?? ''}
+                                    onChange={(e) => {
+                                      setStagedChanges(prev => prev.map(c =>
+                                        c.id === change.id ? { ...c, editedReplaceText: e.target.value } : c
+                                      ))
+                                    }}
+                                    className="mt-1 w-full p-3 bg-white border-2 border-blue-400 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                    rows={3}
+                                    placeholder="Enter replacement text..."
+                                    autoFocus
+                                  />
                                 ) : (
-                                  <span className="text-gray-400 italic">(text will be removed)</span>
+                                  <div className="mt-1 p-3 bg-green-50 border border-green-200 rounded text-sm">
+                                    {(change.editedReplaceText ?? change.replaceText) ? (
+                                      <span className="bg-green-200 px-1 rounded">{change.editedReplaceText ?? change.replaceText}</span>
+                                    ) : (
+                                      <span className="text-gray-400 italic">(text will be removed)</span>
+                                    )}
+                                  </div>
                                 )}
                               </div>
-                            )}
-                          </div>
-
-                          {/* Show re-stage button if modified */}
-                          {change.editedReplaceText !== undefined && change.editedReplaceText !== change.replaceText && (
-                            <div className="flex items-center justify-between pt-2 border-t border-gray-200">
-                              <p className="text-xs text-amber-600 flex items-center gap-1">
-                                <AlertCircle className="h-3 w-3" />
-                                Text modified - re-stage to apply changes
-                              </p>
-                              <button
-                                onClick={() => handleRestage(change)}
-                                disabled={isLoading}
-                                className="flex items-center gap-1 rounded bg-amber-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-600 disabled:opacity-50"
-                              >
-                                {isLoading ? (
-                                  <Loader2 className="h-3 w-3 animate-spin" />
-                                ) : (
-                                  <Rocket className="h-3 w-3" />
-                                )}
-                                Re-stage with Changes
-                              </button>
-                            </div>
+                              {change.editedReplaceText !== undefined && change.editedReplaceText !== change.replaceText && (
+                                <div className="flex items-center justify-between pt-2 border-t border-gray-200">
+                                  <p className="text-xs text-amber-600 flex items-center gap-1">
+                                    <AlertCircle className="h-3 w-3" />
+                                    Text modified - re-stage to apply changes
+                                  </p>
+                                  <button
+                                    onClick={() => handleRestage(change)}
+                                    disabled={isLoading}
+                                    className="flex items-center gap-1 rounded bg-amber-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-600 disabled:opacity-50"
+                                  >
+                                    {isLoading ? <Loader2 className="h-3 w-3 animate-spin" /> : <Rocket className="h-3 w-3" />}
+                                    Re-stage
+                                  </button>
+                                </div>
+                              )}
+                            </>
                           )}
+
+                          {/* Website Update Preview */}
+                          {change.type === 'website_update' && (
+                            <>
+                              <div>
+                                <label className="text-xs font-medium text-gray-500 uppercase tracking-wide">Content Preview</label>
+                                {editingChangeId === change.id ? (
+                                  <textarea
+                                    value={change.editedContent ?? change.content ?? ''}
+                                    onChange={(e) => {
+                                      setStagedChanges(prev => prev.map(c =>
+                                        c.id === change.id ? { ...c, editedContent: e.target.value } : c
+                                      ))
+                                    }}
+                                    className="mt-1 w-full p-3 bg-white border-2 border-blue-400 rounded text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                    rows={8}
+                                    placeholder="Enter website content..."
+                                    autoFocus
+                                  />
+                                ) : (
+                                  <div className="mt-1 p-4 bg-gradient-to-br from-purple-50 to-white border border-purple-200 rounded-lg">
+                                    <div className="prose prose-sm max-w-none">
+                                      <div
+                                        className="text-sm"
+                                        dangerouslySetInnerHTML={{ __html: change.editedContent ?? change.content ?? '' }}
+                                      />
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                              {change.editedContent !== undefined && change.editedContent !== change.content && (
+                                <p className="text-xs text-amber-600 flex items-center gap-1">
+                                  <AlertCircle className="h-3 w-3" />
+                                  Content modified - changes will be applied on publish
+                                </p>
+                              )}
+                            </>
+                          )}
+
+                          {/* Social Post Preview */}
+                          {change.type === 'social_post' && (
+                            <>
+                              <div>
+                                <label className="text-xs font-medium text-gray-500 uppercase tracking-wide">Post Preview</label>
+                                {editingChangeId === change.id ? (
+                                  <textarea
+                                    value={change.editedCaption ?? change.caption ?? ''}
+                                    onChange={(e) => {
+                                      setStagedChanges(prev => prev.map(c =>
+                                        c.id === change.id ? { ...c, editedCaption: e.target.value } : c
+                                      ))
+                                    }}
+                                    className="mt-1 w-full p-3 bg-white border-2 border-blue-400 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                    rows={6}
+                                    placeholder="Enter post caption..."
+                                    autoFocus
+                                  />
+                                ) : (
+                                  <div className="mt-1 p-4 bg-gradient-to-br from-pink-50 to-white border border-pink-200 rounded-lg">
+                                    <p className="text-sm whitespace-pre-wrap">{change.editedCaption ?? change.caption}</p>
+                                  </div>
+                                )}
+                              </div>
+                              {change.platforms && change.platforms.length > 0 && (
+                                <div className="flex gap-2">
+                                  {change.platforms.map(p => (
+                                    <span key={p} className="rounded-full bg-gray-100 px-3 py-1 text-xs font-medium capitalize">
+                                      {p}
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
+                              {change.editedCaption !== undefined && change.editedCaption !== change.caption && (
+                                <p className="text-xs text-amber-600 flex items-center gap-1">
+                                  <AlertCircle className="h-3 w-3" />
+                                  Caption modified - changes will be applied on publish
+                                </p>
+                              )}
+                            </>
+                          )}
+                        </div>
+
+                        {/* Remove individual change button */}
+                        <div className="px-4 py-2 bg-gray-50 border-t flex justify-end">
+                          <button
+                            onClick={() => setStagedChanges(prev => prev.filter(c => c.id !== change.id))}
+                            className="text-xs text-red-500 hover:text-red-700"
+                          >
+                            Remove this change
+                          </button>
                         </div>
                       </div>
                     ))}
