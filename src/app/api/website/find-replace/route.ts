@@ -3,7 +3,8 @@ import { readFile, writeFile, copyFile, readdir, mkdir, access } from 'fs/promis
 import { join } from 'path'
 import { exec } from 'child_process'
 import { promisify } from 'util'
-import { findAndReplace as githubFindAndReplace, isGitHubAvailable, searchInFiles } from '@/lib/github'
+import { findAndReplace as githubFindAndReplace, isGitHubAvailable, searchInFiles, prepareChangesForStaging } from '@/lib/github'
+import { stageChanges, type StagedFile } from '@/lib/github-staging'
 
 const execAsync = promisify(exec)
 
@@ -87,9 +88,9 @@ function getContext(lines: string[], lineIndex: number): string {
     .join('\n')
 }
 
-// GitHub-based find and replace
+// GitHub-based find and replace with human-in-the-loop approval
 async function handleGitHubFindReplace(body: FindReplaceRequest) {
-  const { find, replace, preview = false, caseSensitive = false } = body
+  const { find, replace = '', preview = false, caseSensitive = false } = body
 
   if (!isGitHubAvailable()) {
     return NextResponse.json(
@@ -99,18 +100,19 @@ async function handleGitHubFindReplace(body: FindReplaceRequest) {
   }
 
   try {
-    const result = await githubFindAndReplace(find, replace, caseSensitive, preview)
-
-    if (result.matchCount === 0) {
-      return NextResponse.json({
-        success: false,
-        message: `No matches found for "${find}" in the repository`,
-        matchCount: 0,
-        mode: 'github',
-      })
-    }
-
+    // For preview mode, use the existing function
     if (preview) {
+      const result = await githubFindAndReplace(find, replace, caseSensitive, true)
+
+      if (result.matchCount === 0) {
+        return NextResponse.json({
+          success: false,
+          message: `No matches found for "${find}" in the repository`,
+          matchCount: 0,
+          mode: 'github',
+        })
+      }
+
       return NextResponse.json({
         success: true,
         preview: true,
@@ -129,30 +131,56 @@ async function handleGitHubFindReplace(body: FindReplaceRequest) {
       })
     }
 
-    // Applied changes
-    const successCount = result.updates?.filter(u => u.success).length || 0
-    const failedUpdates = result.updates?.filter(u => !u.success) || []
+    // For apply mode, stage the changes for human approval instead of committing directly
+    const preparedChanges = await prepareChangesForStaging(find, replace, caseSensitive)
+
+    if (preparedChanges.matchCount === 0) {
+      return NextResponse.json({
+        success: false,
+        message: `No matches found for "${find}" in the repository`,
+        matchCount: 0,
+        mode: 'github',
+      })
+    }
+
+    // Convert to StagedFile format and stage the changes
+    const stagedFiles: StagedFile[] = preparedChanges.files.map(f => ({
+      path: f.path,
+      originalContent: f.originalContent,
+      newContent: f.newContent,
+      sha: f.sha,
+      changes: f.changes,
+    }))
+
+    const staged = stageChanges({
+      findText: find,
+      replaceText: replace,
+      files: stagedFiles,
+      matchCount: preparedChanges.matchCount,
+    })
+
+    // Build matches array for response
+    const allMatches = preparedChanges.files.flatMap(f =>
+      f.changes.map(c => ({
+        file: f.path,
+        relativePath: f.path,
+        line: c.line,
+        before: c.before,
+        after: c.after,
+        context: `Line ${c.line}: ${c.before}`,
+      }))
+    )
 
     return NextResponse.json({
-      success: successCount > 0,
+      success: true,
       preview: false,
-      staged: false,
-      matchCount: result.matchCount,
-      filesAffected: result.filesAffected,
-      filesUpdated: successCount,
-      matches: result.matches.map(m => ({
-        file: m.path,
-        relativePath: m.path,
-        line: m.line,
-        before: m.before,
-        after: m.after,
-        context: `Line ${m.line}: ${m.before}`,
-      })),
-      committed: true,
-      deployed: true,
-      deployUrl: 'https://ndce-platform.vercel.app',
-      errors: failedUpdates.length > 0 ? failedUpdates : undefined,
-      message: `Successfully replaced ${result.matchCount} occurrence(s) in ${successCount} file(s). Changes committed to GitHub and will auto-deploy to Vercel.`,
+      staged: true,
+      stagingId: staged.id,
+      matchCount: preparedChanges.matchCount,
+      filesAffected: preparedChanges.files.length,
+      matches: allMatches,
+      requiresApproval: true,
+      message: `Found ${preparedChanges.matchCount} occurrence(s) in ${preparedChanges.files.length} file(s). Changes staged for approval. Use the Publish button to approve and commit to GitHub.`,
       mode: 'github',
     })
   } catch (error) {

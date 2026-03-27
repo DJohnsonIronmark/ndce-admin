@@ -32,6 +32,15 @@ interface SiteReview {
 
 const NDCE_WEBSITE_URL = 'https://ndce-platform.vercel.app'
 
+// All pages to crawl for complete review
+const SITE_PAGES = [
+  { name: 'Home', path: '/' },
+  { name: 'About', path: '/about' },
+  { name: 'Classes', path: '/classes' },
+  { name: 'Schedule', path: '/schedule' },
+  { name: 'Contact', path: '/contact' },
+]
+
 // Fetch and parse website content
 async function fetchWebsiteContent(url: string): Promise<string> {
   const response = await fetch(url, {
@@ -71,8 +80,8 @@ function extractTextContent(html: string): string {
   return text
 }
 
-// Extract structured content from HTML for review
-function extractStructuredContent(html: string): SiteReview {
+// Extract structured content from HTML for review (single page)
+function extractStructuredContent(html: string, pageName?: string): SiteReview {
   // Extract title
   const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i)
   const title = titleMatch ? titleMatch[1].trim() : 'Unknown'
@@ -80,45 +89,23 @@ function extractStructuredContent(html: string): SiteReview {
   // Get full text content
   const fullText = extractTextContent(html)
 
-  // Extract sections based on common patterns
+  // Extract sections - include full content, not truncated
   const sections: ContentSection[] = []
 
-  // Look for hero/header content
-  const heroMatch = html.match(/<(?:section|div)[^>]*(?:hero|header|banner)[^>]*>([\s\S]*?)<\/(?:section|div)>/i)
-  if (heroMatch) {
-    sections.push({ name: 'Hero/Header', content: extractTextContent(heroMatch[1]).substring(0, 500) })
+  // For single page, just include the full text as one section
+  if (pageName) {
+    sections.push({ name: pageName, content: fullText })
+  } else {
+    // Try to extract sections from HTML structure
+    // Look for main content area
+    const mainMatch = html.match(/<main[^>]*>([\s\S]*?)<\/main>/i)
+    const mainContent = mainMatch ? extractTextContent(mainMatch[1]) : fullText
+
+    // Split into logical chunks (not truncated)
+    sections.push({ name: 'Main Content', content: mainContent })
   }
 
-  // Look for about section
-  const aboutMatch = html.match(/<(?:section|div)[^>]*(?:about|intro)[^>]*>([\s\S]*?)<\/(?:section|div)>/i)
-  if (aboutMatch) {
-    sections.push({ name: 'About', content: extractTextContent(aboutMatch[1]).substring(0, 500) })
-  }
-
-  // Look for programs/classes section
-  const programsMatch = html.match(/<(?:section|div)[^>]*(?:program|class|course)[^>]*>([\s\S]*?)<\/(?:section|div)>/i)
-  if (programsMatch) {
-    sections.push({ name: 'Programs/Classes', content: extractTextContent(programsMatch[1]).substring(0, 500) })
-  }
-
-  // Look for contact section
-  const contactMatch = html.match(/<(?:section|div)[^>]*(?:contact|footer)[^>]*>([\s\S]*?)<\/(?:section|div)>/i)
-  if (contactMatch) {
-    sections.push({ name: 'Contact/Footer', content: extractTextContent(contactMatch[1]).substring(0, 500) })
-  }
-
-  // If no sections found, create chunks from full text
-  if (sections.length === 0) {
-    const chunkSize = 500
-    for (let i = 0; i < Math.min(fullText.length, 2000); i += chunkSize) {
-      sections.push({
-        name: `Content ${Math.floor(i / chunkSize) + 1}`,
-        content: fullText.substring(i, i + chunkSize)
-      })
-    }
-  }
-
-  // Extract key information
+  // Extract key information from full text
   const keyInfo: SiteReview['keyInfo'] = {}
 
   // Find age references (ages 2, ages 3, 2 years old, etc.)
@@ -148,6 +135,68 @@ function extractStructuredContent(html: string): SiteReview {
     keyInfo,
     fullText,
     wordCount,
+  }
+}
+
+// Crawl all site pages for comprehensive review
+async function crawlAllPages(baseUrl: string): Promise<SiteReview> {
+  const allSections: ContentSection[] = []
+  const allKeyInfo: SiteReview['keyInfo'] = {
+    ages: [],
+    phoneNumbers: [],
+    emails: [],
+    addresses: [],
+  }
+  let totalWordCount = 0
+  let siteTitle = ''
+  const allText: string[] = []
+
+  for (const page of SITE_PAGES) {
+    try {
+      const url = `${baseUrl}${page.path}`
+      const html = await fetchWebsiteContent(url)
+      const review = extractStructuredContent(html, page.name)
+
+      if (!siteTitle && review.title) {
+        siteTitle = review.title
+      }
+
+      // Add sections with page name prefix
+      review.sections.forEach(section => {
+        allSections.push({
+          name: `${page.name}`,
+          content: section.content,
+        })
+      })
+
+      // Merge key info
+      if (review.keyInfo.ages) {
+        allKeyInfo.ages = [...new Set([...(allKeyInfo.ages || []), ...review.keyInfo.ages])]
+      }
+      if (review.keyInfo.phoneNumbers) {
+        allKeyInfo.phoneNumbers = [...new Set([...(allKeyInfo.phoneNumbers || []), ...review.keyInfo.phoneNumbers])]
+      }
+      if (review.keyInfo.emails) {
+        allKeyInfo.emails = [...new Set([...(allKeyInfo.emails || []), ...review.keyInfo.emails])]
+      }
+
+      totalWordCount += review.wordCount
+      allText.push(review.fullText)
+    } catch (error) {
+      console.warn(`Failed to fetch ${page.name}:`, error)
+      allSections.push({
+        name: page.name,
+        content: `[Page not accessible]`,
+      })
+    }
+  }
+
+  return {
+    title: siteTitle,
+    sections: allSections,
+    keyInfo: allKeyInfo,
+    fullText: allText.join('\n\n---\n\n'),
+    wordCount: totalWordCount,
   }
 }
 
@@ -184,21 +233,22 @@ export async function POST(request: NextRequest) {
     const body: VerifyRequest = await request.json()
     const { searchText, url = NDCE_WEBSITE_URL, mode = 'search' } = body
 
-    // Fetch the website
-    const html = await fetchWebsiteContent(url)
-
-    // Review mode - return full structured content analysis
+    // Review mode - crawl all pages for comprehensive analysis
     if (mode === 'review' || (!searchText && !mode)) {
-      const review = extractStructuredContent(html)
+      const review = await crawlAllPages(url)
 
       return NextResponse.json({
         success: true,
         mode: 'review',
         url,
+        pagesCrawled: SITE_PAGES.map(p => p.name),
         review,
-        message: `Website review complete. Found ${review.sections.length} sections, ${review.wordCount} words.`,
+        message: `Website review complete. Crawled ${SITE_PAGES.length} pages, found ${review.wordCount} total words.`,
       })
     }
+
+    // Fetch the main page for other modes
+    const html = await fetchWebsiteContent(url)
 
     // Search mode - look for specific text
     const textContent = extractTextContent(html)
@@ -244,19 +294,19 @@ export async function GET(request: NextRequest) {
   const url = searchParams.get('url') || NDCE_WEBSITE_URL
 
   try {
-    const html = await fetchWebsiteContent(url)
-
-    // Review mode
+    // Review mode - crawl all pages
     if (mode === 'review') {
-      const review = extractStructuredContent(html)
+      const review = await crawlAllPages(url)
       return NextResponse.json({
         success: true,
         mode: 'review',
         url,
+        pagesCrawled: SITE_PAGES.map(p => p.name),
         review,
       })
     }
 
+    const html = await fetchWebsiteContent(url)
     const textContent = extractTextContent(html)
 
     if (q) {

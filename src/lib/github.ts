@@ -281,3 +281,96 @@ export async function getRepoInfo(): Promise<{ name: string; default_branch: str
 
   return response.json()
 }
+
+// Prepare changes for staging (returns file data without committing)
+export interface StagedFileData {
+  path: string
+  originalContent: string
+  newContent: string
+  sha: string
+  changes: Array<{
+    line: number
+    before: string
+    after: string
+  }>
+}
+
+export async function prepareChangesForStaging(
+  findText: string,
+  replaceText: string,
+  caseSensitive: boolean = false
+): Promise<{
+  files: StagedFileData[]
+  matchCount: number
+}> {
+  const files = await listFiles('src')
+  const stagedFiles: StagedFileData[] = []
+  let totalMatchCount = 0
+
+  const flags = caseSensitive ? 'g' : 'gi'
+  const regex = new RegExp(escapeRegex(findText), flags)
+
+  const preserveCaseReplace = (original: string, find: string, replace: string): string => {
+    if (original === find.toUpperCase()) return replace.toUpperCase()
+    if (original === find.toLowerCase()) return replace.toLowerCase()
+    if (original[0] === find[0].toUpperCase() && original.slice(1) === find.slice(1).toLowerCase()) {
+      return replace[0].toUpperCase() + replace.slice(1).toLowerCase()
+    }
+    return replace
+  }
+
+  const replacer = caseSensitive
+    ? () => replaceText
+    : (match: string) => preserveCaseReplace(match, findText, replaceText)
+
+  for (const file of files) {
+    try {
+      const { content, sha } = await getFileContent(file.path)
+      const lines = content.split('\n')
+      const changes: Array<{ line: number; before: string; after: string }> = []
+
+      lines.forEach((line, index) => {
+        if (regex.test(line)) {
+          regex.lastIndex = 0
+          const newLine = line.replace(regex, replacer)
+          changes.push({
+            line: index + 1,
+            before: line.trim().substring(0, 200),
+            after: newLine.trim().substring(0, 200),
+          })
+        }
+      })
+
+      if (changes.length > 0) {
+        const newContent = content.replace(new RegExp(escapeRegex(findText), flags), replacer)
+        stagedFiles.push({
+          path: file.path,
+          originalContent: content,
+          newContent,
+          sha,
+          changes,
+        })
+        totalMatchCount += changes.length
+      }
+    } catch (error) {
+      console.warn(`Could not process ${file.path}:`, error)
+    }
+  }
+
+  return { files: stagedFiles, matchCount: totalMatchCount }
+}
+
+// Commit staged changes to GitHub
+export async function commitStagedChanges(
+  files: Array<{ path: string; newContent: string; sha: string }>,
+  commitMessage: string
+): Promise<UpdateResult[]> {
+  const results: UpdateResult[] = []
+
+  for (const file of files) {
+    const result = await updateFile(file.path, file.newContent, file.sha, commitMessage)
+    results.push(result)
+  }
+
+  return results
+}

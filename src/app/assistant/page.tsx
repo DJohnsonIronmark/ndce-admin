@@ -2,7 +2,7 @@
 
 import { useState, useRef } from 'react'
 import Sidebar from '@/components/Sidebar'
-import { Send, Upload, Image, Video, FileText, Sparkles, Globe, MessageSquare, X, Check, Loader2, Clock, CheckCircle, XCircle, Rocket, ListTodo, Play, AlertCircle } from 'lucide-react'
+import { Send, Upload, Image, Video, FileText, Sparkles, Globe, MessageSquare, X, Check, Loader2, Clock, CheckCircle, XCircle, Rocket, ListTodo, Play, AlertCircle, Edit2, Eye, ChevronDown, ChevronUp } from 'lucide-react'
 import ProgressTracker, { ProgressStep, UPDATE_STEPS, VERIFY_STEPS } from '@/components/ProgressTracker'
 
 interface Message {
@@ -62,6 +62,10 @@ interface StagedChange {
   replaceText: string
   matchCount: number
   filesAffected: number
+  stagingId: string  // Required for GitHub mode approval
+  previewContent?: string  // The full content context for preview
+  editedReplaceText?: string  // User-edited replacement text
+  isEditing?: boolean  // Whether this change is being edited
 }
 
 const EXAMPLE_PROMPTS = [
@@ -95,6 +99,8 @@ Just tell me what you'd like to do, or upload some content to get started!`,
   const [isPublishing, setIsPublishing] = useState(false)
   const [taskList, setTaskList] = useState<TaskItem[]>([])
   const [isProcessingTask, setIsProcessingTask] = useState(false)
+  const [previewExpanded, setPreviewExpanded] = useState(true)
+  const [editingChangeId, setEditingChangeId] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
@@ -129,8 +135,8 @@ Just tell me what you'd like to do, or upload some content to get started!`,
         { ...VERIFY_STEPS.UNDERSTANDING, status: 'active' },
       ])
 
-      // Call real AI endpoint with conversation history
-      const response = await fetch('/api/chat', {
+      // Call agentic AI assistant with tool capabilities
+      const response = await fetch('/api/assistant', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -141,7 +147,53 @@ Just tell me what you'd like to do, or upload some content to get started!`,
 
       const result = await response.json()
 
-      if (result.success && result.intent) {
+      // Handle agentic response
+      if (result.success && result.response) {
+        // Clear progress
+        setProgressSteps([])
+
+        // Show tools used if any
+        if (result.toolsUsed && result.toolsUsed.length > 0) {
+          const toolNames = result.toolsUsed.map((t: { name: string }) => t.name).join(', ')
+          setMessages(prev => [...prev, {
+            id: `tools-${Date.now()}`,
+            role: 'assistant',
+            content: `🔧 *Used tools: ${toolNames}*`,
+            timestamp: new Date(),
+          }])
+        }
+
+        // Add main response
+        setMessages(prev => [...prev, {
+          id: Date.now().toString(),
+          role: 'assistant',
+          content: result.response,
+          timestamp: new Date(),
+        }])
+
+        // Handle task list if created
+        if (result.taskList) {
+          setTaskList(result.taskList)
+        }
+
+        setIsLoading(false)
+        return
+      }
+
+      // Fallback to old chat API for compatibility
+      const chatResponse = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: input,
+          history: getConversationHistory(),
+        }),
+      })
+
+      const chatResult = await chatResponse.json()
+
+      if (chatResult.success && chatResult.intent) {
+        const result = chatResult
         // Handle verify intent with progress tracking
         if (result.intent.type === 'verify' && result.intent.verifyText) {
           setProgressSteps([
@@ -296,17 +348,32 @@ Just tell me what you'd like to do, or upload some content to get started!`,
             content?: string
             section?: string
             status: string
-          }, index: number) => ({
-            id: `task-${Date.now()}-${index}`,
-            type: task.type as TaskItem['type'],
-            description: task.description,
-            findText: task.findText,
-            replaceText: task.replaceText,
-            verifyText: task.verifyText,
-            content: task.content,
-            section: task.section,
-            status: task.status === 'ready' ? 'ready' : 'pending',
-          }))
+          }, index: number) => {
+            // Determine if task is ready based on having required fields
+            let isReady = task.status === 'ready'
+
+            // For find_replace tasks, check if we have findText (replaceText can be empty for removal)
+            if (task.type === 'find_replace' && task.findText && task.replaceText !== undefined) {
+              isReady = true
+            }
+
+            // For verify tasks, check if we have verifyText
+            if (task.type === 'verify' && task.verifyText) {
+              isReady = true
+            }
+
+            return {
+              id: `task-${Date.now()}-${index}`,
+              type: task.type as TaskItem['type'],
+              description: task.description,
+              findText: task.findText,
+              replaceText: task.replaceText,
+              verifyText: task.verifyText,
+              content: task.content,
+              section: task.section,
+              status: isReady ? 'ready' : 'pending',
+            }
+          })
 
           setTaskList(tasks)
 
@@ -866,7 +933,7 @@ Just tell me what you'd like to do, or upload some content to get started!`,
               return msg
             }))
 
-            // Add staged change for tracking
+            // Add staged change for tracking (includes stagingId for GitHub mode)
             setStagedChanges(prev => [...prev, {
               suggestionId,
               messageId,
@@ -874,6 +941,7 @@ Just tell me what you'd like to do, or upload some content to get started!`,
               replaceText: suggestion.replaceText!,
               matchCount: result.matchCount,
               filesAffected: result.filesAffected,
+              stagingId: result.stagingId || '',
             }])
 
             // Add approval message
@@ -938,26 +1006,36 @@ Just tell me what you'd like to do, or upload some content to get started!`,
     ])
 
     try {
-      // Build commit message from all staged changes
-      const commitMessage = stagedChanges.map(c =>
-        `Replace "${c.findText}" with "${c.replaceText}" (${c.matchCount} occurrences)`
-      ).join('; ')
+      // Publish each staged change with its stagingId
+      let allSuccess = true
+      let totalFilesUpdated = 0
+
+      for (const change of stagedChanges) {
+        const finalReplaceText = change.editedReplaceText ?? change.replaceText
+        const commitMessage = `Replace "${change.findText}" with "${finalReplaceText}" (${change.matchCount} occurrences)`
+
+        const response = await fetch('/api/website/publish', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'publish',
+            stagingId: change.stagingId,
+            commitMessage,
+          }),
+        })
+
+        const result = await response.json()
+        if (!result.success) {
+          allSuccess = false
+          break
+        }
+        totalFilesUpdated += result.filesUpdated || change.filesAffected
+      }
 
       updateProgress('committing', 'complete', 'Changes committed')
       updateProgress('pushing', 'active')
 
-      const response = await fetch('/api/website/publish', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'publish',
-          commitMessage: `Website updates: ${commitMessage}`,
-        }),
-      })
-
-      const result = await response.json()
-
-      if (result.success) {
+      if (allSuccess) {
         updateProgress('pushing', 'complete', 'Pushed to GitHub')
         updateProgress('deploying', 'active')
 
@@ -989,11 +1067,11 @@ Just tell me what you'd like to do, or upload some content to get started!`,
         setMessages(prev => [...prev, {
           id: Date.now().toString(),
           role: 'assistant',
-          content: `🚀 **Published successfully!**\n\nYour changes are now being deployed to:\n${result.deployUrl || 'https://ndce-platform.vercel.app'}\n\nDeployment typically takes 30-60 seconds.`,
+          content: `🚀 **Published successfully!**\n\nYour changes are now being deployed to:\nhttps://ndce-platform.vercel.app\n\nDeployment typically takes 30-60 seconds.`,
           timestamp: new Date(),
         }])
       } else {
-        throw new Error(result.message || 'Publish failed')
+        throw new Error('Some changes failed to publish')
       }
     } catch (error) {
       console.error('Publish error:', error)
@@ -1007,6 +1085,87 @@ Just tell me what you'd like to do, or upload some content to get started!`,
     } finally {
       setIsPublishing(false)
       setTimeout(() => setProgressSteps([]), 3000)
+    }
+  }
+
+  // Re-stage a change with edited text
+  const handleRestage = async (change: StagedChange) => {
+    if (!change.editedReplaceText) return
+
+    setIsLoading(true)
+    setProgressSteps([
+      { ...UPDATE_STEPS.FINDING, status: 'active' },
+      { ...UPDATE_STEPS.APPLYING, status: 'pending' },
+      { ...UPDATE_STEPS.STAGING, status: 'pending' },
+    ])
+
+    try {
+      // First, reject the old staged change
+      if (change.stagingId) {
+        await fetch('/api/website/publish', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'rollback', stagingId: change.stagingId }),
+        })
+      }
+
+      updateProgress('finding', 'complete', `Found matches for "${change.findText}"`)
+      updateProgress('applying', 'active')
+
+      // Stage with the new replacement text
+      const response = await fetch('/api/website/find-replace', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          find: change.findText,
+          replace: change.editedReplaceText,
+          preview: false,
+          staged: true,
+          autoDeploy: false,
+        }),
+      })
+
+      const result = await response.json()
+
+      if (result.success && result.matchCount > 0) {
+        updateProgress('applying', 'complete', `${result.matchCount} changes applied`)
+        updateProgress('staging', 'complete', 'Changes re-staged')
+
+        // Update the staged change with new values
+        setStagedChanges(prev => prev.map(c =>
+          c.suggestionId === change.suggestionId
+            ? {
+                ...c,
+                replaceText: change.editedReplaceText!,
+                editedReplaceText: undefined,
+                matchCount: result.matchCount,
+                filesAffected: result.filesAffected,
+                stagingId: result.stagingId || '',
+              }
+            : c
+        ))
+
+        setMessages(prev => [...prev, {
+          id: Date.now().toString(),
+          role: 'assistant',
+          content: `✅ **Changes re-staged**\n\nUpdated replacement: **"${change.findText}"** → **"${change.editedReplaceText}"**\n\n${result.matchCount} occurrence(s) in ${result.filesAffected} file(s) ready for approval.`,
+          timestamp: new Date(),
+        }])
+      } else {
+        updateProgress('applying', 'error', result.message || 'No matches found')
+        setMessages(prev => [...prev, {
+          id: Date.now().toString(),
+          role: 'assistant',
+          content: `⚠️ **Re-staging failed**: ${result.message || 'No matches found for the original text.'}`,
+          timestamp: new Date(),
+        }])
+      }
+    } catch (error) {
+      console.error('Restage error:', error)
+      updateProgress('applying', 'error', 'Failed to re-stage')
+    } finally {
+      setIsLoading(false)
+      setTimeout(() => setProgressSteps([]), 2000)
     }
   }
 
@@ -1071,7 +1230,7 @@ Just tell me what you'd like to do, or upload some content to get started!`,
     ))
 
     try {
-      if (task.type === 'find_replace' && task.findText && task.replaceText) {
+      if (task.type === 'find_replace' && task.findText && task.replaceText !== undefined) {
         // Execute find-replace
         const response = await fetch('/api/website/find-replace', {
           method: 'POST',
@@ -1091,7 +1250,7 @@ Just tell me what you'd like to do, or upload some content to get started!`,
             t.id === taskId ? { ...t, status: 'completed', result: `Replaced ${result.matchCount} occurrence(s) in ${result.filesAffected} file(s)` } : t
           ))
 
-          // Add to staged changes
+          // Add to staged changes (includes stagingId for GitHub mode)
           setStagedChanges(prev => [...prev, {
             suggestionId: taskId,
             messageId: 'task',
@@ -1099,6 +1258,7 @@ Just tell me what you'd like to do, or upload some content to get started!`,
             replaceText: task.replaceText!,
             matchCount: result.matchCount,
             filesAffected: result.filesAffected,
+            stagingId: result.stagingId || '',
           }])
         } else {
           setTaskList(prev => prev.map(t =>
@@ -1173,21 +1333,30 @@ Just tell me what you'd like to do, or upload some content to get started!`,
         <div className="flex flex-1 overflow-hidden">
           {/* Chat Area */}
           <div className="flex flex-1 flex-col">
-            {/* Staged Changes Banner */}
+            {/* Staged Changes Preview Panel */}
             {stagedChanges.length > 0 && (
-              <div className="bg-amber-50 border-b border-amber-200 px-6 py-3">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-3">
-                    <Clock className="h-5 w-5 text-amber-600" />
-                    <div>
+              <div className="bg-amber-50 border-b border-amber-200">
+                {/* Header with collapse toggle */}
+                <div className="px-6 py-3 flex items-center justify-between border-b border-amber-200">
+                  <button
+                    onClick={() => setPreviewExpanded(!previewExpanded)}
+                    className="flex items-center gap-3 hover:opacity-80"
+                  >
+                    {previewExpanded ? (
+                      <ChevronUp className="h-5 w-5 text-amber-600" />
+                    ) : (
+                      <ChevronDown className="h-5 w-5 text-amber-600" />
+                    )}
+                    <Eye className="h-5 w-5 text-amber-600" />
+                    <div className="text-left">
                       <p className="font-medium text-amber-800">
                         {stagedChanges.length} change{stagedChanges.length > 1 ? 's' : ''} awaiting approval
                       </p>
                       <p className="text-sm text-amber-600">
-                        Review and approve to publish to your website
+                        {previewExpanded ? 'Click to collapse preview' : 'Click to expand preview'}
                       </p>
                     </div>
-                  </div>
+                  </button>
                   <div className="flex gap-2">
                     <button
                       onClick={handleReject}
@@ -1199,7 +1368,7 @@ Just tell me what you'd like to do, or upload some content to get started!`,
                     </button>
                     <button
                       onClick={handlePublish}
-                      disabled={isPublishing}
+                      disabled={isPublishing || editingChangeId !== null}
                       className="flex items-center gap-1 rounded-lg bg-green-600 px-4 py-2 text-sm font-medium text-white hover:bg-green-700 disabled:opacity-50"
                     >
                       {isPublishing ? (
@@ -1211,6 +1380,131 @@ Just tell me what you'd like to do, or upload some content to get started!`,
                     </button>
                   </div>
                 </div>
+
+                {/* Expanded Preview Content */}
+                {previewExpanded && (
+                  <div className="px-6 py-4 space-y-4 max-h-96 overflow-y-auto">
+                    {stagedChanges.map((change, index) => (
+                      <div key={change.suggestionId || index} className="bg-white rounded-lg border border-amber-200 overflow-hidden">
+                        {/* Change Header */}
+                        <div className="px-4 py-2 bg-gray-50 border-b flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <Globe className="h-4 w-4 text-blue-600" />
+                            <span className="text-sm font-medium text-gray-700">
+                              Find & Replace ({change.matchCount} occurrence{change.matchCount !== 1 ? 's' : ''} in {change.filesAffected} file{change.filesAffected !== 1 ? 's' : ''})
+                            </span>
+                          </div>
+                          {editingChangeId !== change.suggestionId ? (
+                            <button
+                              onClick={() => {
+                                setEditingChangeId(change.suggestionId)
+                                setStagedChanges(prev => prev.map(c =>
+                                  c.suggestionId === change.suggestionId
+                                    ? { ...c, editedReplaceText: c.editedReplaceText ?? c.replaceText }
+                                    : c
+                                ))
+                              }}
+                              className="flex items-center gap-1 text-xs text-blue-600 hover:text-blue-800"
+                            >
+                              <Edit2 className="h-3 w-3" />
+                              Edit
+                            </button>
+                          ) : (
+                            <div className="flex items-center gap-2">
+                              <button
+                                onClick={() => {
+                                  // Save the edit
+                                  setEditingChangeId(null)
+                                }}
+                                className="flex items-center gap-1 text-xs text-green-600 hover:text-green-800"
+                              >
+                                <Check className="h-3 w-3" />
+                                Save
+                              </button>
+                              <button
+                                onClick={() => {
+                                  // Cancel the edit
+                                  setStagedChanges(prev => prev.map(c =>
+                                    c.suggestionId === change.suggestionId
+                                      ? { ...c, editedReplaceText: c.replaceText }
+                                      : c
+                                  ))
+                                  setEditingChangeId(null)
+                                }}
+                                className="flex items-center gap-1 text-xs text-gray-500 hover:text-gray-700"
+                              >
+                                <X className="h-3 w-3" />
+                                Cancel
+                              </button>
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Before/After Preview */}
+                        <div className="p-4 space-y-3">
+                          {/* Before */}
+                          <div>
+                            <label className="text-xs font-medium text-gray-500 uppercase tracking-wide">Before</label>
+                            <div className="mt-1 p-3 bg-red-50 border border-red-200 rounded text-sm">
+                              <span className="bg-red-200 px-1 rounded">{change.findText}</span>
+                            </div>
+                          </div>
+
+                          {/* After (editable) */}
+                          <div>
+                            <label className="text-xs font-medium text-gray-500 uppercase tracking-wide">After</label>
+                            {editingChangeId === change.suggestionId ? (
+                              <textarea
+                                value={change.editedReplaceText ?? change.replaceText}
+                                onChange={(e) => {
+                                  setStagedChanges(prev => prev.map(c =>
+                                    c.suggestionId === change.suggestionId
+                                      ? { ...c, editedReplaceText: e.target.value }
+                                      : c
+                                  ))
+                                }}
+                                className="mt-1 w-full p-3 bg-white border-2 border-blue-400 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                rows={3}
+                                placeholder="Enter replacement text..."
+                                autoFocus
+                              />
+                            ) : (
+                              <div className="mt-1 p-3 bg-green-50 border border-green-200 rounded text-sm">
+                                {(change.editedReplaceText ?? change.replaceText) ? (
+                                  <span className="bg-green-200 px-1 rounded">{change.editedReplaceText ?? change.replaceText}</span>
+                                ) : (
+                                  <span className="text-gray-400 italic">(text will be removed)</span>
+                                )}
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Show re-stage button if modified */}
+                          {change.editedReplaceText !== undefined && change.editedReplaceText !== change.replaceText && (
+                            <div className="flex items-center justify-between pt-2 border-t border-gray-200">
+                              <p className="text-xs text-amber-600 flex items-center gap-1">
+                                <AlertCircle className="h-3 w-3" />
+                                Text modified - re-stage to apply changes
+                              </p>
+                              <button
+                                onClick={() => handleRestage(change)}
+                                disabled={isLoading}
+                                className="flex items-center gap-1 rounded bg-amber-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-600 disabled:opacity-50"
+                              >
+                                {isLoading ? (
+                                  <Loader2 className="h-3 w-3 animate-spin" />
+                                ) : (
+                                  <Rocket className="h-3 w-3" />
+                                )}
+                                Re-stage with Changes
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
 

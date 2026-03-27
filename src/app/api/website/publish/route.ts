@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server'
 import { exec } from 'child_process'
 import { promisify } from 'util'
 import { access } from 'fs/promises'
+import { commitStagedChanges } from '@/lib/github'
+import { getStagedChanges, getAllPendingChanges, updateStagedStatus, removeStagedChanges } from '@/lib/github-staging'
 
 const execAsync = promisify(exec)
 
@@ -10,6 +12,7 @@ const NDCE_PLATFORM_ROOT = '/Users/drewjohnson/Downloads/ProBono Kids Activities
 interface PublishRequest {
   action: 'publish' | 'rollback' | 'status'
   commitMessage?: string
+  stagingId?: string  // Required for GitHub mode publish/rollback
 }
 
 // Check if local filesystem is available
@@ -25,25 +28,137 @@ async function isLocalAvailable(): Promise<boolean> {
 export async function POST(request: NextRequest) {
   try {
     const body: PublishRequest = await request.json()
-    const { action, commitMessage } = body
+    const { action, commitMessage, stagingId } = body
 
     // Check if we're in local mode
     const localAvailable = await isLocalAvailable()
 
     if (!localAvailable) {
-      // In GitHub mode, changes are committed directly - no staging
+      // GitHub mode - handle staged changes approval
       if (action === 'publish') {
+        if (!stagingId) {
+          // Check if there are any pending changes
+          const pendingChanges = getAllPendingChanges()
+          if (pendingChanges.length === 0) {
+            return NextResponse.json({
+              success: false,
+              message: 'No staged changes to publish. Apply changes first using find-replace.',
+              mode: 'github',
+            })
+          }
+          // If no stagingId provided but there are pending changes, use the most recent one
+          const mostRecent = pendingChanges[0]
+          return NextResponse.json({
+            success: false,
+            message: `Found ${pendingChanges.length} pending change(s). Please specify which to publish.`,
+            pendingChanges: pendingChanges.map(p => ({
+              id: p.id,
+              findText: p.findText,
+              replaceText: p.replaceText,
+              matchCount: p.matchCount,
+              filesCount: p.files.length,
+              createdAt: p.createdAt,
+            })),
+            mode: 'github',
+          })
+        }
+
+        // Get the staged changes
+        const staged = getStagedChanges(stagingId)
+        if (!staged) {
+          return NextResponse.json({
+            success: false,
+            message: 'Staged changes not found or expired. Please apply changes again.',
+            mode: 'github',
+          })
+        }
+
+        if (staged.status !== 'pending') {
+          return NextResponse.json({
+            success: false,
+            message: `These changes have already been ${staged.status}.`,
+            mode: 'github',
+          })
+        }
+
+        // Commit the staged changes to GitHub
+        const message = commitMessage || `Website update: Replace "${staged.findText}" with "${staged.replaceText}" (${staged.matchCount} occurrences)`
+
+        const results = await commitStagedChanges(
+          staged.files.map(f => ({
+            path: f.path,
+            newContent: f.newContent,
+            sha: f.sha,
+          })),
+          message
+        )
+
+        const successCount = results.filter(r => r.success).length
+        const failedResults = results.filter(r => !r.success)
+
+        if (successCount > 0) {
+          updateStagedStatus(stagingId, 'approved')
+          removeStagedChanges(stagingId)
+        }
+
         return NextResponse.json({
-          success: true,
+          success: successCount > 0,
           action: 'published',
-          message: 'In GitHub mode, changes are committed directly when applied. No separate publish step needed.',
+          filesUpdated: successCount,
+          totalFiles: staged.files.length,
+          matchCount: staged.matchCount,
+          errors: failedResults.length > 0 ? failedResults : undefined,
+          message: successCount === staged.files.length
+            ? `Successfully published ${staged.matchCount} change(s) across ${successCount} file(s). Deployment will begin shortly.`
+            : `Published ${successCount} of ${staged.files.length} files. Some files failed to update.`,
+          deployUrl: 'https://ndce-platform.vercel.app',
           mode: 'github',
         })
+
       } else if (action === 'rollback') {
+        if (!stagingId) {
+          // Discard all pending changes
+          const pendingChanges = getAllPendingChanges()
+          if (pendingChanges.length === 0) {
+            return NextResponse.json({
+              success: true,
+              action: 'rolled_back',
+              message: 'No staged changes to discard.',
+              mode: 'github',
+            })
+          }
+
+          // Mark all as rejected
+          pendingChanges.forEach(p => {
+            updateStagedStatus(p.id, 'rejected')
+            removeStagedChanges(p.id)
+          })
+
+          return NextResponse.json({
+            success: true,
+            action: 'rolled_back',
+            message: `Discarded ${pendingChanges.length} pending change(s).`,
+            mode: 'github',
+          })
+        }
+
+        // Discard specific staged changes
+        const staged = getStagedChanges(stagingId)
+        if (!staged) {
+          return NextResponse.json({
+            success: false,
+            message: 'Staged changes not found or already processed.',
+            mode: 'github',
+          })
+        }
+
+        updateStagedStatus(stagingId, 'rejected')
+        removeStagedChanges(stagingId)
+
         return NextResponse.json({
-          success: false,
-          action: 'rollback',
-          message: 'Rollback not available in GitHub mode. Use git revert on the repository to undo changes.',
+          success: true,
+          action: 'rolled_back',
+          message: `Discarded staged changes: "${staged.findText}" → "${staged.replaceText}"`,
           mode: 'github',
         })
       }
@@ -113,12 +228,33 @@ export async function GET() {
   const localAvailable = await isLocalAvailable()
 
   if (!localAvailable) {
-    // GitHub mode - no local staging
+    // GitHub mode - show pending staged changes
+    const pendingChanges = getAllPendingChanges()
+
     return NextResponse.json({
-      hasChanges: false,
-      changedFiles: [],
-      diffSummary: '',
-      message: 'In GitHub mode, changes are committed directly. No local staging.',
+      hasChanges: pendingChanges.length > 0,
+      changedFiles: pendingChanges.flatMap(p =>
+        p.files.map(f => ({
+          stagingId: p.id,
+          file: f.path,
+          changes: f.changes.length,
+        }))
+      ),
+      pendingChanges: pendingChanges.map(p => ({
+        id: p.id,
+        findText: p.findText,
+        replaceText: p.replaceText,
+        matchCount: p.matchCount,
+        filesCount: p.files.length,
+        createdAt: p.createdAt,
+        files: p.files.map(f => ({
+          path: f.path,
+          changesCount: f.changes.length,
+        })),
+      })),
+      message: pendingChanges.length > 0
+        ? `${pendingChanges.length} change set(s) awaiting approval`
+        : 'No pending changes',
       mode: 'github',
     })
   }

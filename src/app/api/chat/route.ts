@@ -52,17 +52,31 @@ IMPORTANT DISTINCTION between verify and review:
 - **verify**: Search for SPECIFIC text on the website (requires verifyText)
 - **review**: Get a full analysis of ALL content currently on the website (no specific text needed)
 
+CRITICAL - USING CONTEXT FROM CONVERSATION HISTORY:
+- ALWAYS check conversation history for relevant information (phone numbers, names, text from website reviews)
+- If a website review showed phone: "(813) 551-7859" and user says "remove phone number", use that EXACT number
+- If context provides the info needed, mark task as "ready" with the actual values filled in
+- Only mark as "pending" if the information truly cannot be determined from context
+
+IMPORTANT - REMOVAL TASKS:
+- "Remove X" or "Delete X" means find_replace with replaceText: "" (empty string)
+- For removal tasks, search the conversation history for the actual text to remove
+- If the phone number was shown in a website review, use THAT exact number
+- Example: If review showed "(813) 551-7859", and user says "remove phone", then:
+  { "type": "find_replace", "findText": "(813) 551-7859", "replaceText": "", "status": "ready" }
+
 IMPORTANT: When a user sends a message with MULTIPLE requests or tasks (like an email with several items), you MUST:
 1. Identify ALL the individual tasks/requests
 2. Return type: "multi_task" with a "tasks" array listing each one
-3. Each task should have enough detail to be actionable
+3. Use conversation history to fill in actual values where possible
+4. Only mark as "pending" if info is truly missing
 
 For multi-task requests, respond with:
 {
   "type": "multi_task",
   "tasks": [
     { "type": "find_replace", "description": "Update age from 2 to 3", "findText": "ages 2", "replaceText": "ages 3", "status": "ready" },
-    { "type": "find_replace", "description": "Remove phone number", "findText": "813-555-1234", "replaceText": "", "status": "pending" },
+    { "type": "find_replace", "description": "Remove phone number", "findText": "(813) 551-7859", "replaceText": "", "status": "ready" },
     { "type": "website_update", "description": "Add viewing windows info", "content": "...", "section": "about", "status": "pending" },
     { "type": "verify", "description": "Check if ages 3 is on website", "verifyText": "ages 3", "status": "pending" }
   ],
@@ -70,14 +84,14 @@ For multi-task requests, respond with:
 }
 
 Task status meanings:
-- "ready": You have all info needed to execute this task
-- "pending": You need more information from the user to complete this task
+- "ready": You have all info needed to execute this task (including info from conversation history!)
+- "pending": You need more information from the user to complete this task (info not in history)
 
 For SINGLE requests, use the standard format:
 {
   "type": "find_replace" | "website_update" | "social_post" | "verify" | "review" | "question",
   "findText": "text to find (for find_replace)",
-  "replaceText": "replacement text (for find_replace)",
+  "replaceText": "replacement text (for find_replace, use empty string for removals)",
   "verifyText": "text to verify (for verify - NOT needed for review)",
   "content": "content for website/social",
   "section": "hero | about | schedule | announcement",
@@ -88,7 +102,9 @@ For SINGLE requests, use the standard format:
 ALWAYS respond with valid JSON. Use conversation history to maintain context about previous changes made.
 
 Examples:
-- "Change ages 2 to ages 3" → type: find_replace
+- "Change ages 2 to ages 3" → type: find_replace, status: ready
+- "Remove phone number" (if number known from context) → findText: "actual number", replaceText: "", status: ready
+- "Remove lead teacher" (if name known from context) → findText: "actual name", replaceText: "", status: ready
 - "Verify the website shows ages 3" → type: verify, verifyText: "ages 3"
 - "Review the current website" → type: review (NO verifyText needed)
 - "What content is on the site?" → type: review
