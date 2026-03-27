@@ -12,7 +12,10 @@ import {
   Users,
   Bot,
   FileEdit,
+  LogOut,
+  User,
 } from 'lucide-react'
+import { useAuth } from '@/lib/auth-context'
 
 const navigation = [
   { name: 'Dashboard', href: '/', icon: LayoutDashboard },
@@ -27,6 +30,7 @@ const navigation = [
 
 export default function Sidebar() {
   const pathname = usePathname()
+  const { user, signOut } = useAuth()
 
   return (
     <div className="flex h-full w-64 flex-col bg-gray-900">
@@ -59,6 +63,21 @@ export default function Sidebar() {
         })}
       </nav>
       <div className="border-t border-gray-800 p-4">
+        {user && (
+          <div className="mb-3">
+            <div className="flex items-center gap-2 text-sm text-gray-300">
+              <User className="h-4 w-4 text-gray-400" />
+              <span className="truncate">{user.email}</span>
+            </div>
+            <button
+              onClick={() => signOut()}
+              className="mt-2 flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm text-gray-400 hover:bg-gray-800 hover:text-white"
+            >
+              <LogOut className="h-4 w-4" />
+              Sign out
+            </button>
+          </div>
+        )}
         <p className="text-xs text-gray-500">Nicole&apos;s Dance Center Elite</p>
       </div>
     </div>
