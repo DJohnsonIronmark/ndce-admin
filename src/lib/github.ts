@@ -273,6 +273,37 @@ export function isGitHubAvailable(): boolean {
   return !!process.env.GITHUB_TOKEN
 }
 
+// Upload a binary file (image, video, etc.) directly to the site repo.
+// Skips the read-decode-as-utf8 path used by updateFile, which would
+// corrupt non-text content.
+export async function uploadBinaryFile(
+  path: string,
+  base64Content: string,
+  message: string,
+): Promise<UpdateResult> {
+  try {
+    const response = await githubFetch(`/repos/${REPO_OWNER}/${REPO_NAME}/contents/${path}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message,
+        content: base64Content,
+        branch: DEFAULT_BRANCH,
+      }),
+    })
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}))
+      return { success: false, path, error: error.message || `HTTP ${response.status}` }
+    }
+
+    const data = await response.json()
+    return { success: true, path, sha: data.content.sha }
+  } catch (error) {
+    return { success: false, path, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+}
+
 // Get repository info
 export async function getRepoInfo(): Promise<{ name: string; default_branch: string; html_url: string }> {
   const response = await githubFetch(`/repos/${REPO_OWNER}/${REPO_NAME}`)

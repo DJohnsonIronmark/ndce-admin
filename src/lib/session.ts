@@ -84,3 +84,16 @@ export function buildClearSessionCookie(): string {
 }
 
 export const SESSION_COOKIE_NAME = COOKIE_NAME
+
+// Helper for API routes to require an authenticated session.
+// Returns the verified session payload or null. The caller decides
+// the response shape (some routes 401, others redirect).
+export async function requireSession(request: Request): Promise<SessionPayload | null> {
+  const secret = process.env.SESSION_SECRET
+  if (!secret) return null
+  const cookieHeader = request.headers.get('cookie') || ''
+  const match = cookieHeader.match(new RegExp(`(?:^|;\\s*)${COOKIE_NAME}=([^;]+)`))
+  if (!match) return null
+  const token = decodeURIComponent(match[1])
+  return await verifySession(token, secret)
+}

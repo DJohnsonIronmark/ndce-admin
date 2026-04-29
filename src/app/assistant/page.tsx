@@ -18,8 +18,11 @@ interface Message {
 interface Attachment {
   type: 'image' | 'video' | 'text'
   name: string
-  url?: string
+  url?: string  // local object URL for preview thumb
   preview?: string
+  uploadStatus?: 'uploading' | 'uploaded' | 'failed'
+  uploadedPath?: string  // public path after committed via /api/uploads/image
+  uploadError?: string
 }
 
 interface Suggestion {
@@ -130,6 +133,13 @@ Just tell me what you'd like to do, or upload some content to get started!`,
     e.preventDefault()
     if (!input.trim() && attachments.length === 0) return
 
+    // Don't dispatch while images are still uploading — the assistant
+    // would just see no usable attachments. The submit button is also
+    // disabled in this state, so this is defense-in-depth.
+    if (attachments.some(a => a.uploadStatus === 'uploading')) {
+      return
+    }
+
     const userMessage: Message = {
       id: Date.now().toString(),
       role: 'user',
@@ -149,6 +159,12 @@ Just tell me what you'd like to do, or upload some content to get started!`,
         { ...VERIFY_STEPS.UNDERSTANDING, status: 'active' },
       ])
 
+      // Only forward attachments that finished uploading; placeholders or
+      // failed uploads can't be referenced server-side.
+      const uploadedAttachments = attachments
+        .filter(a => a.uploadStatus === 'uploaded' && a.uploadedPath)
+        .map(a => ({ type: a.type, name: a.name, uploadedPath: a.uploadedPath }))
+
       // Call agentic AI assistant with tool capabilities
       const response = await fetch('/api/assistant', {
         method: 'POST',
@@ -156,6 +172,7 @@ Just tell me what you'd like to do, or upload some content to get started!`,
         body: JSON.stringify({
           message: input,
           history: getConversationHistory(),
+          attachments: uploadedAttachments,
         }),
       })
 
@@ -829,11 +846,15 @@ Just tell me what you'd like to do, or upload some content to get started!`,
     return `✨ At Nicole's Dance Center Elite ✨\n\n${input}\n\nJoin our dance family today!\n\n#NicolesDanceCenterElite #NDCE #DanceStudio #DanceLife`
   }
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files
     if (!files) return
 
-    const newAttachments: Attachment[] = []
+    // Add placeholders so the user sees the thumb immediately, then upload
+    // each file in the background. Match by name+url to identify which
+    // placeholder to update when the upload finishes.
+    const initialAttachments: Attachment[] = []
+    const filesToUpload: Array<{ file: File; key: string }> = []
 
     Array.from(files).forEach(file => {
       const isImage = file.type.startsWith('image/')
@@ -841,19 +862,54 @@ Just tell me what you'd like to do, or upload some content to get started!`,
 
       if (isImage || isVideo) {
         const url = URL.createObjectURL(file)
-        newAttachments.push({
+        const key = `${file.name}|${file.size}|${url}`
+        initialAttachments.push({
           type: isImage ? 'image' : 'video',
           name: file.name,
           url,
           preview: isImage ? url : undefined,
+          uploadStatus: isImage ? 'uploading' : undefined,
         })
+        if (isImage) filesToUpload.push({ file, key })
       }
     })
 
-    setAttachments(prev => [...prev, ...newAttachments])
-    if (fileInputRef.current) {
-      fileInputRef.current.value = ''
-    }
+    setAttachments(prev => [...prev, ...initialAttachments])
+    if (fileInputRef.current) fileInputRef.current.value = ''
+
+    // Upload images in parallel; video upload not supported yet.
+    await Promise.all(
+      filesToUpload.map(async ({ file }) => {
+        const fd = new FormData()
+        fd.append('file', file)
+        try {
+          const resp = await fetch('/api/uploads/image', { method: 'POST', body: fd })
+          const data = await resp.json().catch(() => ({}))
+          if (!resp.ok || !data.success) {
+            throw new Error(data.error || `Upload failed (${resp.status})`)
+          }
+          setAttachments(prev =>
+            prev.map(a =>
+              a.name === file.name && a.uploadStatus === 'uploading'
+                ? { ...a, uploadStatus: 'uploaded' as const, uploadedPath: data.path }
+                : a,
+            ),
+          )
+        } catch (err) {
+          setAttachments(prev =>
+            prev.map(a =>
+              a.name === file.name && a.uploadStatus === 'uploading'
+                ? {
+                    ...a,
+                    uploadStatus: 'failed' as const,
+                    uploadError: err instanceof Error ? err.message : 'Upload failed',
+                  }
+                : a,
+            ),
+          )
+        }
+      }),
+    )
   }
 
   const removeAttachment = (index: number) => {
@@ -2028,7 +2084,9 @@ Just tell me what you'd like to do, or upload some content to get started!`,
                   {attachments.map((att, index) => (
                     <div
                       key={index}
-                      className="relative flex items-center gap-2 rounded-lg bg-white px-3 py-2 shadow-sm"
+                      className={`relative flex items-center gap-2 rounded-lg bg-white px-3 py-2 shadow-sm ${
+                        att.uploadStatus === 'failed' ? 'ring-1 ring-red-300' : ''
+                      }`}
                     >
                       {att.preview ? (
                         <img src={att.preview} alt="" className="h-8 w-8 rounded object-cover" />
@@ -2038,6 +2096,15 @@ Just tell me what you'd like to do, or upload some content to get started!`,
                         <FileText className="h-5 w-5 text-gray-600" />
                       )}
                       <span className="text-sm text-gray-700">{att.name}</span>
+                      {att.uploadStatus === 'uploading' && (
+                        <Loader2 className="h-3 w-3 animate-spin text-purple-600" />
+                      )}
+                      {att.uploadStatus === 'uploaded' && (
+                        <span className="text-xs text-green-600">✓ uploaded</span>
+                      )}
+                      {att.uploadStatus === 'failed' && (
+                        <span className="text-xs text-red-600" title={att.uploadError}>upload failed</span>
+                      )}
                       <button
                         onClick={() => removeAttachment(index)}
                         className="ml-1 text-gray-400 hover:text-gray-600"
@@ -2085,7 +2152,11 @@ Just tell me what you'd like to do, or upload some content to get started!`,
                 </div>
                 <button
                   type="submit"
-                  disabled={isLoading || (!input.trim() && attachments.length === 0)}
+                  disabled={
+                    isLoading ||
+                    (!input.trim() && attachments.length === 0) ||
+                    attachments.some(a => a.uploadStatus === 'uploading')
+                  }
                   className="rounded-lg bg-purple-600 p-2.5 text-white hover:bg-purple-700 disabled:opacity-50"
                 >
                   <Send className="h-5 w-5" />

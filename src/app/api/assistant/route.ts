@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import Anthropic from '@anthropic-ai/sdk'
 import { ASSISTANT_TOOLS, AGENTIC_SYSTEM_PROMPT, executeTool } from '@/lib/assistant-tools'
+import { requireSession } from '@/lib/session'
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
@@ -29,9 +30,17 @@ interface ChatMessage {
   content: string
 }
 
+interface AssistantAttachment {
+  type: 'image' | 'video' | 'text'
+  name: string
+  uploadedPath?: string  // public URL path after /api/uploads/image succeeds
+  contentType?: string
+}
+
 interface AssistantRequest {
   message: string
   history?: ChatMessage[]
+  attachments?: AssistantAttachment[]
 }
 
 interface StagedChangeFromTool {
@@ -72,10 +81,17 @@ type TextBlock = Anthropic.TextBlock
 
 export async function POST(request: NextRequest) {
   try {
-    const body: AssistantRequest = await request.json()
-    const { message, history = [] } = body
+    // Require an authenticated admin session — this endpoint spends
+    // Anthropic credits and triggers GitHub commits, so it can't be open.
+    const session = await requireSession(request)
+    if (!session) {
+      return NextResponse.json({ error: 'Authentication required' }, { status: 401 })
+    }
 
-    if (!message || message.trim() === '') {
+    const body: AssistantRequest = await request.json()
+    const { message, history = [], attachments = [] } = body
+
+    if ((!message || message.trim() === '') && attachments.length === 0) {
       return NextResponse.json(
         { error: 'Message is required' },
         { status: 400 }
@@ -88,6 +104,16 @@ export async function POST(request: NextRequest) {
         { status: 500 }
       )
     }
+
+    // Build an attachment context block the model can read alongside
+    // the user's message. The image is already committed to the site
+    // repo at this point — the model just needs the public path so it
+    // can put it into JSX with edit_file.
+    const uploadedImages = attachments.filter(a => a.uploadedPath && a.type === 'image')
+    const attachmentContext = uploadedImages.length > 0
+      ? `\n\n[Attached images — already committed to public/uploads/ in the ndce-platform repo, ready to reference in JSX]\n${uploadedImages.map(a => `- "${a.name}" → src="${a.uploadedPath}"`).join('\n')}`
+      : ''
+    const fullMessage = message + attachmentContext
 
     // Get base URL for internal API calls
     const protocol = request.headers.get('x-forwarded-proto') || 'https'
@@ -105,10 +131,10 @@ export async function POST(request: NextRequest) {
       })
     }
 
-    // Add current message
+    // Add current message (with attachment context appended)
     messages.push({
       role: 'user',
-      content: message,
+      content: fullMessage,
     })
 
     // Agentic loop - keep calling Claude until it doesn't use any tools
