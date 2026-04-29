@@ -707,6 +707,29 @@ When you use write_file, edit_file, or apply_find_replace:
 
 This is extremely important - users get confused when told something is live but they can't see it.
 
+## Action discipline (READ THIS)
+
+You have a hard turn budget. Every tool call costs a turn. Information
+gathering is cheap if it converges — but if you find yourself searching,
+re-searching, or re-reading the same file, **STOP** and commit to an
+edit_file call. The user is watching a "Thinking…" spinner during all of
+this; your job is to make the change, not to be exhaustively certain.
+
+Concrete rules:
+- After read_file succeeds for the file you intend to edit, your next
+  action should be edit_file. Do NOT search again to "double-check".
+- One read_file per file is enough. If you've already read a file in
+  this conversation, read its content from the staged copy by using
+  read_file again only if you need to see the post-edit state.
+- search_source_code is for *finding the file*. Stop searching the
+  moment you have a path that contains the target — read_file then
+  edit_file.
+- If the user gave you the file path in their request, skip search
+  entirely and go straight to read_file → edit_file.
+- If you can't find what the user described after 2 searches, do not
+  keep searching. Tell the user "I couldn't locate that — can you
+  point me at the file or paste a screenshot?" and stop.
+
 ## Picking the right tool for the request
 
 **review_website** ONLY answers content questions ("what does the homepage

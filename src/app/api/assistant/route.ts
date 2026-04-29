@@ -11,8 +11,18 @@ const anthropic = new Anthropic({
 // Pro allows up to 300s.
 export const maxDuration = 300
 
-// Maximum number of agentic turns to prevent infinite loops
-const MAX_TURNS = 15
+// Maximum number of agentic turns to prevent infinite loops.
+// Multi-file changes (e.g. JSX + accompanying CSS) need ~10–15 turns;
+// 25 leaves headroom for retries and verification.
+const MAX_TURNS = 25
+
+// If the agent makes this many consecutive search/read calls without any
+// stage-producing edit, append a hint to the next tool result nudging it
+// to commit to an edit_file or apply_find_replace call.
+const STALL_THRESHOLD = 4
+
+const STAGE_PRODUCING_TOOLS = new Set(['edit_file', 'write_file', 'apply_find_replace'])
+const RECON_TOOLS = new Set(['search_source_code', 'search_website', 'review_website', 'list_files', 'read_file', 'preview_find_replace', 'get_component_info'])
 
 interface ChatMessage {
   role: 'user' | 'assistant'
@@ -143,7 +153,20 @@ export async function POST(request: NextRequest) {
 
       for (const toolUse of toolUseBlocks) {
         const rawResult = await executeTool(toolUse.name, toolUse.input as Record<string, unknown>, baseUrl)
-        const { cleaned: result, payload } = extractStagingPayload(rawResult)
+        let { cleaned: result, payload } = extractStagingPayload(rawResult)
+
+        // Stalled-loop nudge: if the agent has been doing recon-only calls
+        // for a while without producing a staged change, append a hint to
+        // the result so the model sees the prompt to commit.
+        const recentToolNames = toolResults.slice(-STALL_THRESHOLD).map(t => t.name)
+        const inRunOfRecon =
+          recentToolNames.length >= STALL_THRESHOLD &&
+          recentToolNames.every(n => RECON_TOOLS.has(n)) &&
+          stagedChanges.length === 0 &&
+          RECON_TOOLS.has(toolUse.name)
+        if (inRunOfRecon) {
+          result = `${result}\n\n---\n⚠️ **Coach note:** You've made ${recentToolNames.length} information-gathering calls in a row without staging a change. You almost certainly have enough context now. Your next action should be \`edit_file\` (preferred), \`write_file\`, or \`apply_find_replace\` — not another search or read. If you don't know what to edit, say so to the user instead of searching more.`
+        }
 
         // Check if this is a task list creation
         if (toolUse.name === 'create_task_list') {
