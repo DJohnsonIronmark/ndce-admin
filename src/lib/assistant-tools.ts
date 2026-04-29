@@ -3,6 +3,19 @@
 
 import Anthropic from '@anthropic-ai/sdk'
 import { listFiles as ghListFiles, getFileContent, updateFile, searchInFiles, isGitHubAvailable } from './github'
+import { getAllGenericPendingChanges } from './github-staging'
+
+// Returns the most recent staged version of `path` if any edits to that file
+// are already pending in this session. This lets sequential edit_file/write_file
+// calls compose: each new edit applies on top of the previous staged content
+// instead of fresh-fetching from GitHub (which would lose the earlier change).
+function getStagedFileContent(path: string): string | null {
+  const pending = getAllGenericPendingChanges()
+  for (const change of pending) {
+    if (change.path === path && change.content) return change.content
+  }
+  return null
+}
 
 export const ASSISTANT_TOOLS: Anthropic.Tool[] = [
   {
@@ -426,13 +439,32 @@ export async function executeTool(
         }
         const { path } = toolInput as { path: string }
         try {
-          const { content, sha } = await getFileContent(path)
+          // If this file already has a pending staged edit, read THAT so the
+          // assistant sees its own in-progress changes instead of stale main.
+          const stagedContent = getStagedFileContent(path)
+          let content: string
+          let sha: string
+          let stagingNote = ''
+          if (stagedContent !== null) {
+            content = stagedContent
+            try {
+              const fresh = await getFileContent(path)
+              sha = fresh.sha
+            } catch {
+              sha = ''
+            }
+            stagingNote = '\n**Note:** Reading staged content (this file has pending edits in this session).'
+          } else {
+            const fresh = await getFileContent(path)
+            content = fresh.content
+            sha = fresh.sha
+          }
 
           // Add line numbers for easier reference
           const lines = content.split('\n')
           const numberedContent = lines.map((line, i) => `${String(i + 1).padStart(4, ' ')} | ${line}`).join('\n')
 
-          return `## File: ${path}\n\n**SHA:** ${sha}\n**Lines:** ${lines.length}\n\n\`\`\`\n${numberedContent}\n\`\`\``
+          return `## File: ${path}\n\n**SHA:** ${sha}\n**Lines:** ${lines.length}${stagingNote}\n\n\`\`\`\n${numberedContent}\n\`\`\``
         } catch (error) {
           return `Error reading file "${path}": ${error instanceof Error ? error.message : 'Unknown error'}`
         }
@@ -490,8 +522,26 @@ export async function executeTool(
           description: string
         }
         try {
-          // Read the current file
-          const { content: currentContent, sha } = await getFileContent(path)
+          // If a prior tool call already staged an edit to this file in the same
+          // session, build on top of that staged content. Otherwise pull fresh
+          // from GitHub. SHA always tracks the GitHub HEAD so the eventual
+          // commit replaces the right blob.
+          const stagedContent = getStagedFileContent(path)
+          let currentContent: string
+          let sha: string
+          if (stagedContent !== null) {
+            currentContent = stagedContent
+            try {
+              const fresh = await getFileContent(path)
+              sha = fresh.sha
+            } catch {
+              sha = ''
+            }
+          } else {
+            const fresh = await getFileContent(path)
+            currentContent = fresh.content
+            sha = fresh.sha
+          }
 
           // Check if old content exists
           if (!currentContent.includes(oldContent)) {
@@ -668,8 +718,12 @@ This is extremely important - users get confused when told something is live but
 - **Always read before editing**: Use read_file before edit_file to get exact text
 - **Make targeted edits**: Use edit_file for small changes, not write_file
 - **Preserve code style**: Match the existing indentation and formatting
-- **One change at a time**: Make small, focused changes that are easy to review
 - **Explain your changes**: Tell the user what you changed and why
+- **Compose related changes**: If a single user request needs multiple
+  edits to the same file (e.g. add an import AND swap JSX that uses it),
+  the engine will stack later edits on top of earlier staged ones — so
+  it's safe to issue them sequentially. read_file always returns the
+  most recent staged content if any pending edits exist.
 
 ## Project Structure (NDCE Website — DJohnsonIronmark/ndce-platform)
 
