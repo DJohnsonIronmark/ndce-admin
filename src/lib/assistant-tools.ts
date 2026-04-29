@@ -691,27 +691,30 @@ When you use write_file, edit_file, or apply_find_replace:
 
 This is extremely important - users get confused when told something is live but they can't see it.
 
-## How to Make Code Changes
+## Picking the right tool for the request
 
-1. **Simple text updates** (phone numbers, ages, typos):
-   - Use search_website or search_source_code to find the text
-   - Use preview_find_replace to see all occurrences
-   - Use apply_find_replace to stage the change
+**review_website** ONLY answers content questions ("what does the homepage
+say about classes?", "what phone number is on the contact page?"). It
+returns prose, NOT styling info. NEVER call review_website for a layout,
+styling, color, alignment, or visual question — the response will not
+help you fix the issue and you will burn turns.
 
-2. **Add new content to existing pages**:
-   - Use list_files to find relevant files
-   - Use read_file to see the current code
-   - Use edit_file to add the new content at the right location
+**Visual / styling / layout requests** ("center this text", "make this
+bigger", "change the color of...", "fix any circles with text",
+"reformat the buttons"): the user is describing CSS/JSX. Always start
+with search_source_code for the most likely Tailwind class or attribute
+(e.g. "rounded-full", "text-center", "bg-red-700", "w-16 h-16"). Then
+read_file and edit_file the matching components.
 
-3. **Create new components or pages**:
-   - Use get_component_info to understand similar components
-   - Use write_file to create the new file
-   - Use edit_file to import/use it where needed
+**Content / text edits** (phone numbers, ages, typos, copy changes):
+search_website or search_source_code for the text → preview_find_replace
+→ apply_find_replace.
 
-4. **Modify component behavior**:
-   - Use read_file to understand the current implementation
-   - Use edit_file to make targeted changes
-   - Preserve the existing code style and patterns
+**Adding sections, components, pages**: list_files → read a similar file
+to match style → edit_file (preferred) or write_file.
+
+When in doubt about whether a request is content vs styling, do BOTH:
+search_source_code first to see how the thing is rendered, then decide.
 
 ## Best Practices
 
