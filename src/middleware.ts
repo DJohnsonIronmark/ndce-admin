@@ -1,9 +1,10 @@
 import { NextResponse, type NextRequest } from 'next/server'
+import { SESSION_COOKIE_NAME, verifySession } from '@/lib/session'
 
 export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl
 
-  // Allow login page and static assets
+  // Allow login page, auth API, static assets, all other API routes, and files with extensions.
   if (
     pathname === '/login' ||
     pathname.startsWith('/_next') ||
@@ -13,22 +14,24 @@ export async function middleware(request: NextRequest) {
     return NextResponse.next()
   }
 
-  // Check for Supabase auth token in cookies
-  // Supabase stores auth in cookies with project-specific names
-  const cookies = request.cookies.getAll()
-
-  // Look for any Supabase auth cookie (handles various cookie naming patterns)
-  const hasAuthCookie = cookies.some(cookie =>
-    cookie.name.includes('sb-') &&
-    (cookie.name.includes('-auth-token') ||
-     cookie.name === 'sb-access-token' ||
-     cookie.name === 'sb-refresh-token')
-  )
-
-  // If no auth cookies found, redirect to login
-  if (!hasAuthCookie) {
+  const secret = process.env.SESSION_SECRET
+  if (!secret) {
+    // Fail closed when not configured.
     const loginUrl = new URL('/login', request.url)
+    loginUrl.searchParams.set('error', 'config')
     return NextResponse.redirect(loginUrl)
+  }
+
+  const token = request.cookies.get(SESSION_COOKIE_NAME)?.value
+  if (!token) {
+    return NextResponse.redirect(new URL('/login', request.url))
+  }
+
+  const payload = await verifySession(token, secret)
+  if (!payload) {
+    const res = NextResponse.redirect(new URL('/login', request.url))
+    res.cookies.delete(SESSION_COOKIE_NAME)
+    return res
   }
 
   return NextResponse.next()
@@ -36,13 +39,7 @@ export async function middleware(request: NextRequest) {
 
 export const config = {
   matcher: [
-    /*
-     * Match all request paths except:
-     * - _next/static (static files)
-     * - _next/image (image optimization files)
-     * - favicon.ico (favicon file)
-     * - public folder
-     */
+    // Match everything except static asset extensions and Next internals.
     '/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)',
   ],
 }
