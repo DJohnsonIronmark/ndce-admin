@@ -8,6 +8,9 @@ import { stageChanges, type StagedFile } from '@/lib/github-staging'
 
 const execAsync = promisify(exec)
 
+// listFiles + getFileContent recursion across the repo can take a while.
+export const maxDuration = 300
+
 interface FindReplaceRequest {
   find: string
   replace: string

@@ -7,6 +7,9 @@ import { getStagedChanges, getAllPendingChanges, updateStagedStatus, removeStage
 
 const execAsync = promisify(exec)
 
+// Multi-file publish iterates over staged files; allow up to 5 min.
+export const maxDuration = 300
+
 const NDCE_PLATFORM_ROOT = '/Users/drewjohnson/Downloads/ProBono Kids Activities Memory/clients/nicoles-dance-center-elite/ndce-platform'
 
 interface PublishRequest {

@@ -6,6 +6,11 @@ const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 })
 
+// Vercel Pro default timeout is 15s; an agentic loop with several tool
+// calls (~3–8s each) easily overruns that and the UI stalls on "Thinking".
+// Pro allows up to 300s.
+export const maxDuration = 300
+
 // Maximum number of agentic turns to prevent infinite loops
 const MAX_TURNS = 15
 
