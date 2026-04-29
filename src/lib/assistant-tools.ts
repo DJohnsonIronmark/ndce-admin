@@ -460,11 +460,13 @@ export async function executeTool(
             sha = fresh.sha
           }
 
-          // Add line numbers for easier reference
+          // Add line numbers for easier reference. IMPORTANT: the leading
+          // "NN | " prefix is display-only — it is NOT part of the file's
+          // bytes and must be stripped before passing text to edit_file.
           const lines = content.split('\n')
           const numberedContent = lines.map((line, i) => `${String(i + 1).padStart(4, ' ')} | ${line}`).join('\n')
 
-          return `## File: ${path}\n\n**SHA:** ${sha}\n**Lines:** ${lines.length}${stagingNote}\n\n\`\`\`\n${numberedContent}\n\`\`\``
+          return `## File: ${path}\n\n**SHA:** ${sha}\n**Lines:** ${lines.length}${stagingNote}\n\n⚠️ The "NN | " prefix on each line below is for reading only. **DO NOT** include it in edit_file's oldContent — strip the prefix and pass only the actual file text.\n\n\`\`\`\n${numberedContent}\n\`\`\``
         } catch (error) {
           return `Error reading file "${path}": ${error instanceof Error ? error.message : 'Unknown error'}`
         }
@@ -543,13 +545,27 @@ export async function executeTool(
             sha = fresh.sha
           }
 
+          // Defense in depth: if oldContent looks like it was copied from
+          // read_file's numbered display ("  NN | actual line"), strip the
+          // prefix so the match has a chance to succeed even if the model
+          // forgot to do it.
+          const looksLikeNumberedLines = oldContent.split('\n').every(l => /^\s*\d+\s*\|\s/.test(l) || l === '')
+          const normalizedOld = looksLikeNumberedLines
+            ? oldContent.split('\n').map(l => l.replace(/^\s*\d+\s*\|\s?/, '')).join('\n')
+            : oldContent
+
           // Check if old content exists
-          if (!currentContent.includes(oldContent)) {
-            return `Error: Could not find the specified text in "${path}".\n\nThe text you're looking for:\n\`\`\`\n${oldContent}\n\`\`\`\n\nMake sure to use the exact text including whitespace. Use read_file first to see the current content.`
+          let effectiveOld: string
+          if (currentContent.includes(oldContent)) {
+            effectiveOld = oldContent
+          } else if (normalizedOld !== oldContent && currentContent.includes(normalizedOld)) {
+            effectiveOld = normalizedOld
+          } else {
+            return `Error: Could not find the specified text in "${path}".\n\nThe text you're looking for:\n\`\`\`\n${oldContent}\n\`\`\`\n\nMake sure to use the exact text including whitespace, and DO NOT include the "NN | " line-number prefix from read_file output. Use read_file first to see the current content.`
           }
 
           // Create the new content
-          const updatedContent = currentContent.replace(oldContent, newContent)
+          const updatedContent = currentContent.replace(effectiveOld, newContent)
 
           // Stage the edit operation
           const response = await fetch(`${baseUrl}/api/website/file-operation`, {
@@ -721,6 +737,13 @@ search_source_code first to see how the thing is rendered, then decide.
 - **Always read before editing**: Use read_file before edit_file to get exact text
 - **Make targeted edits**: Use edit_file for small changes, not write_file
 - **Preserve code style**: Match the existing indentation and formatting
+- **Strip line-number prefixes**: read_file shows content with a "  NN | "
+  prefix on each line for human legibility. That prefix is NOT part of
+  the file. When passing text to edit_file's oldContent, strip the
+  "NN | " prefix and pass only the actual file bytes (matching original
+  indentation exactly). If your first edit_file fails with "Could not
+  find the specified text", check that you removed the line-number
+  prefixes — that's the most common cause.
 - **Explain your changes**: Tell the user what you changed and why
 - **Compose related changes**: If a single user request needs multiple
   edits to the same file (e.g. add an import AND swap JSX that uses it),
