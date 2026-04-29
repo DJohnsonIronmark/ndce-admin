@@ -179,6 +179,9 @@ async function handleGitHubFindReplace(body: FindReplaceRequest) {
       matchCount: preparedChanges.matchCount,
       filesAffected: preparedChanges.files.length,
       matches: allMatches,
+      // Inline the prepared file contents so the caller can publish without
+      // relying on the in-memory staging store (lost across serverless invocations).
+      files: preparedChanges.files.map(f => ({ path: f.path, newContent: f.newContent, sha: f.sha })),
       requiresApproval: true,
       message: `Found ${preparedChanges.matchCount} occurrence(s) in ${preparedChanges.files.length} file(s). Changes staged for approval. Use the Publish button to approve and commit to GitHub.`,
       mode: 'github',
@@ -311,7 +314,7 @@ async function handleLocalFindReplace(body: FindReplaceRequest) {
       const commitMessage = `Update: Replace "${find}" with "${replace}" (${allMatches.length} occurrences)`
       await execAsync(`cd "${NDCE_PLATFORM_ROOT}" && git commit -m "${commitMessage}"`)
       await execAsync(`cd "${NDCE_PLATFORM_ROOT}" && git push origin main`)
-      deployResult = { committed: true, deployed: true, deployUrl: 'https://ndce-platform.vercel.app' }
+      deployResult = { committed: true, deployed: true, deployUrl: 'https://ndce-site-v2.vercel.app' }
     } catch (error) {
       console.error('Commit/deploy error:', error)
       deployResult = { committed: false, deployed: false, error: error instanceof Error ? error.message : 'Unknown error' }

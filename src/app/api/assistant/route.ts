@@ -33,6 +33,21 @@ interface StagedChangeFromTool {
   content?: string
   platforms?: string[]
   caption?: string
+  files?: Array<{ path: string; newContent: string; sha: string }>
+}
+
+// Extracts and strips a JSON payload embedded by tools so they can pass
+// structured staging data back to the route without breaking the string contract.
+function extractStagingPayload(result: string): { cleaned: string; payload: { files?: Array<{ path: string; newContent: string; sha: string }> } | null } {
+  const match = result.match(/<staging_payload>([\s\S]*?)<\/staging_payload>/)
+  if (!match) return { cleaned: result, payload: null }
+  try {
+    const payload = JSON.parse(match[1])
+    const cleaned = result.replace(match[0], '').trim()
+    return { cleaned, payload }
+  } catch {
+    return { cleaned: result, payload: null }
+  }
 }
 
 // Use types from Anthropic SDK
@@ -122,7 +137,8 @@ export async function POST(request: NextRequest) {
       const toolResultsForMessage: Anthropic.ToolResultBlockParam[] = []
 
       for (const toolUse of toolUseBlocks) {
-        const result = await executeTool(toolUse.name, toolUse.input as Record<string, unknown>, baseUrl)
+        const rawResult = await executeTool(toolUse.name, toolUse.input as Record<string, unknown>, baseUrl)
+        const { cleaned: result, payload } = extractStagingPayload(rawResult)
 
         // Check if this is a task list creation
         if (toolUse.name === 'create_task_list') {
@@ -137,7 +153,7 @@ export async function POST(request: NextRequest) {
         }
 
         // Check if this is a staged change from apply_find_replace
-        if (toolUse.name === 'apply_find_replace' && result.includes('Changes Staged')) {
+        if (toolUse.name === 'apply_find_replace' && result.includes('STAGED (NOT LIVE)')) {
           const input = toolUse.input as { findText?: string; replaceText?: string }
           // Extract staging info from result (handles markdown formatting like **Staging ID:**)
           const stagingIdMatch = result.match(/\*?\*?Staging ID:\*?\*?\s*(staged_\S+)/)
@@ -154,11 +170,12 @@ export async function POST(request: NextRequest) {
             matchCount: matchCountMatch ? parseInt(matchCountMatch[1]) : 0,
             filesAffected: filesMatch ? parseInt(filesMatch[1]) : 0,
             stagingId: stagingIdMatch ? stagingIdMatch[1] : '',
+            files: payload?.files,
           })
         }
 
         // Check if this is a staged file write
-        if (toolUse.name === 'write_file' && result.includes('Staged for Approval')) {
+        if (toolUse.name === 'write_file' && result.includes('STAGED (NOT LIVE)')) {
           const input = toolUse.input as { path?: string; description?: string; content?: string }
           const stagingIdMatch = result.match(/\*?\*?Staging ID:\*?\*?\s*(file-\S+)/)
 
@@ -174,9 +191,12 @@ export async function POST(request: NextRequest) {
         }
 
         // Check if this is a staged file edit
-        if (toolUse.name === 'edit_file' && result.includes('Staged for Approval')) {
+        if (toolUse.name === 'edit_file' && result.includes('STAGED (NOT LIVE)')) {
           const input = toolUse.input as { path?: string; description?: string; oldContent?: string; newContent?: string }
           const stagingIdMatch = result.match(/\*?\*?Staging ID:\*?\*?\s*(file-\S+)/)
+          // For edit_file the route needs the full new content for direct-publish.
+          // Pull it from the staging payload appended by the tool.
+          const fullContent = payload?.files?.[0]?.newContent
 
           stagedChanges.push({
             id: `staged-${Date.now()}-${stagedChanges.length}`,
@@ -184,7 +204,7 @@ export async function POST(request: NextRequest) {
             title: 'File Edit',
             description: input.description || `Edit ${input.path}`,
             section: input.path,
-            content: `Old: ${input.oldContent?.substring(0, 100)}...\nNew: ${input.newContent?.substring(0, 100)}...`,
+            content: fullContent ?? `Old: ${input.oldContent?.substring(0, 100)}...\nNew: ${input.newContent?.substring(0, 100)}...`,
             stagingId: stagingIdMatch ? stagingIdMatch[1] : '',
           })
         }

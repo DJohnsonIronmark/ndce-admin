@@ -17,6 +17,8 @@ interface PublishRequest {
   path?: string
   content?: string
   sha?: string
+  // Multi-file direct publish (used by find_replace) — also bypasses in-memory staging.
+  files?: Array<{ path: string; newContent: string; sha?: string }>
 }
 
 // Check if local filesystem is available
@@ -32,7 +34,7 @@ async function isLocalAvailable(): Promise<boolean> {
 export async function POST(request: NextRequest) {
   try {
     const body: PublishRequest = await request.json()
-    const { action, commitMessage, stagingId, path, content, sha } = body
+    const { action, commitMessage, stagingId, path, content, sha, files } = body
 
     // Check if we're in local mode
     const localAvailable = await isLocalAvailable()
@@ -40,6 +42,38 @@ export async function POST(request: NextRequest) {
     if (!localAvailable) {
       // GitHub mode - handle staged changes approval
       if (action === 'publish') {
+        // DIRECT MULTI-FILE MODE: used by find_replace to publish many files at once
+        // without depending on the in-memory staging store.
+        if (files && files.length > 0) {
+          const message = commitMessage || `Website update (${files.length} file${files.length === 1 ? '' : 's'})`
+          const results = []
+          for (const f of files) {
+            // Always fetch fresh SHA to avoid conflicts when other commits have landed.
+            let currentSha: string | undefined = f.sha
+            try {
+              const fresh = await getFileContent(f.path)
+              currentSha = fresh.sha
+            } catch {
+              currentSha = undefined
+            }
+            const r = await updateFile(f.path, f.newContent, currentSha || '', message)
+            results.push(r)
+          }
+          const successCount = results.filter(r => r.success).length
+          return NextResponse.json({
+            success: successCount > 0,
+            action: 'published',
+            filesUpdated: successCount,
+            totalFiles: files.length,
+            message: successCount === files.length
+              ? `Successfully published ${successCount} file(s). Deployment will begin shortly.`
+              : `Published ${successCount} of ${files.length} files. Some failed.`,
+            errors: results.filter(r => !r.success),
+            deployUrl: 'https://ndce-site-v2.vercel.app',
+            mode: 'github-direct-multi',
+          })
+        }
+
         // DIRECT CONTENT MODE: If path and content are provided, commit directly
         // This bypasses in-memory staging which doesn't work in serverless
         if (path && content) {
@@ -70,7 +104,7 @@ export async function POST(request: NextRequest) {
                 filesUpdated: 1,
                 totalFiles: 1,
                 message: `Successfully published update to ${path}. Deployment will begin shortly.`,
-                deployUrl: 'https://ndce-platform.vercel.app',
+                deployUrl: 'https://ndce-site-v2.vercel.app',
                 mode: 'github-direct',
               })
             } else {
@@ -172,7 +206,7 @@ export async function POST(request: NextRequest) {
                   filesUpdated: 1,
                   totalFiles: 1,
                   message: `Successfully published file update to ${genericStaged.path}. Deployment will begin shortly.`,
-                  deployUrl: 'https://ndce-platform.vercel.app',
+                  deployUrl: 'https://ndce-site-v2.vercel.app',
                   mode: 'github',
                 })
               } else {
@@ -232,7 +266,7 @@ export async function POST(request: NextRequest) {
             message: successCount === staged.files.length
               ? `Successfully published ${staged.matchCount} change(s) across ${successCount} file(s). Deployment will begin shortly.`
               : `Published ${successCount} of ${staged.files.length} files. Some files failed to update.`,
-            deployUrl: 'https://ndce-platform.vercel.app',
+            deployUrl: 'https://ndce-site-v2.vercel.app',
             mode: 'github',
           })
         }
@@ -319,7 +353,7 @@ export async function POST(request: NextRequest) {
         success: true,
         action: 'published',
         message: 'Changes published successfully. Deployment will begin shortly.',
-        deployUrl: 'https://ndce-platform.vercel.app',
+        deployUrl: 'https://ndce-site-v2.vercel.app',
         mode: 'local',
       })
 

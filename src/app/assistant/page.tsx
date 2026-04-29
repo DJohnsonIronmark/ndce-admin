@@ -67,6 +67,8 @@ interface StagedChange {
   filesAffected?: number
   stagingId?: string
   editedReplaceText?: string
+  // For find_replace publish: prepared file contents (bypasses in-memory staging store)
+  files?: Array<{ path: string; newContent: string; sha: string }>
   // For website_update
   section?: string
   content?: string
@@ -206,6 +208,7 @@ Just tell me what you'd like to do, or upload some content to get started!`,
               content?: string
               platforms?: string[]
               caption?: string
+              files?: Array<{ path: string; newContent: string; sha: string }>
             }) => ({
               id: sc.id,
               suggestionId: sc.id,
@@ -222,6 +225,7 @@ Just tell me what you'd like to do, or upload some content to get started!`,
               content: sc.content,
               platforms: sc.platforms,
               caption: sc.caption,
+              files: sc.files,
             }))
           ])
         }
@@ -1141,9 +1145,28 @@ Just tell me what you'd like to do, or upload some content to get started!`,
 
       for (const change of stagedChanges) {
         if (change.type === 'find_replace') {
-          // Publish find-replace via GitHub
+          // Publish find-replace via GitHub.
+          // If the user edited the replacement text, re-apply find/replace to the
+          // staged file contents on the client so we publish the right thing.
           const finalReplaceText = change.editedReplaceText ?? change.replaceText
           const commitMessage = `Replace "${change.findText}" with "${finalReplaceText}" (${change.matchCount} occurrences)`
+
+          let filesToPublish = change.files
+          if (
+            filesToPublish &&
+            change.editedReplaceText !== undefined &&
+            change.editedReplaceText !== change.replaceText &&
+            change.findText
+          ) {
+            const findRegex = new RegExp(
+              change.findText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+              'gi',
+            )
+            filesToPublish = filesToPublish.map(f => ({
+              ...f,
+              newContent: f.newContent.replace(findRegex, finalReplaceText ?? ''),
+            }))
+          }
 
           const response = await fetch('/api/website/publish', {
             method: 'POST',
@@ -1152,6 +1175,9 @@ Just tell me what you'd like to do, or upload some content to get started!`,
               action: 'publish',
               stagingId: change.stagingId,
               commitMessage,
+              // Send prepared file contents so publish does not depend on
+              // the in-memory staging store (which is lost across serverless invocations).
+              files: filesToPublish,
             }),
           })
 

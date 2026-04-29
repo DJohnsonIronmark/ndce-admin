@@ -325,7 +325,13 @@ export async function executeTool(
         if (data.matchCount === 0) {
           return `No matches found for "${findText}". No changes were made.`
         }
-        return `✅ **Find & Replace - STAGED (NOT LIVE)**\n\nReplaced ${data.matchCount} occurrence(s) in ${data.filesAffected} file(s).\n\n**Staging ID:** ${data.stagingId || 'N/A'}\n\n⚠️ **IMPORTANT:** These changes are in the staging area only. They will NOT appear on the website until the user clicks "Approve & Publish" in the right panel.\n\n📋 Tell the user: "I've staged these changes. Please click 'Approve & Publish' to make them live."`
+        const summary = `✅ **Find & Replace - STAGED (NOT LIVE)**\n\nReplaced ${data.matchCount} occurrence(s) in ${data.filesAffected} file(s).\n\n**Staging ID:** ${data.stagingId || 'N/A'}\n\n⚠️ **IMPORTANT:** These changes are in the staging area only. They will NOT appear on the website until the user clicks "Approve & Publish" in the right panel.\n\n📋 Tell the user: "I've staged these changes. Please click 'Approve & Publish' to make them live."`
+        // Embed prepared file contents so the route can pass them directly to publish,
+        // bypassing the in-memory staging store that doesn't survive serverless cold starts.
+        if (Array.isArray(data.files) && data.files.length > 0) {
+          return `${summary}\n\n<staging_payload>${JSON.stringify({ files: data.files })}</staging_payload>`
+        }
+        return summary
       }
 
       case 'search_source_code': {
@@ -513,7 +519,10 @@ export async function executeTool(
           const data = await response.json()
 
           if (data.success) {
-            return `✅ **File Edit - STAGED (NOT LIVE)**\n\n**Path:** ${path}\n**Description:** ${description}\n**Staging ID:** ${data.stagingId || 'N/A'}\n\n**Change Preview:**\n- Removed: \`${oldContent.substring(0, 100)}${oldContent.length > 100 ? '...' : ''}\`\n- Added: \`${newContent.substring(0, 100)}${newContent.length > 100 ? '...' : ''}\`\n\n⚠️ **IMPORTANT:** This change is in the staging area only. It will NOT appear on the website until the user clicks "Approve & Publish" in the right panel.\n\n📋 Tell the user: "I've staged these changes. Please click 'Approve & Publish' to make them live."`
+            const summary = `✅ **File Edit - STAGED (NOT LIVE)**\n\n**Path:** ${path}\n**Description:** ${description}\n**Staging ID:** ${data.stagingId || 'N/A'}\n\n**Change Preview:**\n- Removed: \`${oldContent.substring(0, 100)}${oldContent.length > 100 ? '...' : ''}\`\n- Added: \`${newContent.substring(0, 100)}${newContent.length > 100 ? '...' : ''}\`\n\n⚠️ **IMPORTANT:** This change is in the staging area only. It will NOT appear on the website until the user clicks "Approve & Publish" in the right panel.\n\n📋 Tell the user: "I've staged these changes. Please click 'Approve & Publish' to make them live."`
+            // Pass the full updated content via staging payload so the publish call
+            // can commit directly without depending on the in-memory store.
+            return `${summary}\n\n<staging_payload>${JSON.stringify({ files: [{ path, newContent: updatedContent, sha: sha || '' }] })}</staging_payload>`
           } else {
             return `Failed to stage file edit: ${data.message || 'Unknown error'}`
           }
@@ -662,21 +671,35 @@ This is extremely important - users get confused when told something is live but
 - **One change at a time**: Make small, focused changes that are easy to review
 - **Explain your changes**: Tell the user what you changed and why
 
-## Project Structure (NDCE Website)
+## Project Structure (NDCE Website — DJohnsonIronmark/ndce-platform)
 
 \`\`\`
 src/
-  app/           # Next.js pages and layouts
-  components/    # React components (Header, Footer, etc.)
-  styles/        # CSS and styling
-  lib/           # Utilities and helpers
+  app/
+    (public)/       # Public marketing pages: about, classes, schedule,
+                    #   faculty, company, whats-new, photos-videos, contact
+    (admin)/        # Admin-side pages (separate from this assistant)
+    page.tsx        # Homepage
+    layout.tsx      # Root layout
+  components/
+    layout/         # Header.tsx, Footer.tsx
+    seo/            # StructuredData.tsx
+  lib/
+    data/studio.ts  # Studio info (hours, address, phone, etc.)
+    cloudinary/     # Image hosting helpers
+    supabase/       # DB client
+public/             # Static assets (logos, images)
 \`\`\`
 
 Key components:
-- Header.tsx - Navigation and site header
-- Footer.tsx - Site footer with contact info
-- ContactSection.tsx - Contact form and info
-- ClassesSection.tsx - Dance class listings
+- src/components/layout/Header.tsx — top nav, branding, mobile menu
+- src/components/layout/Footer.tsx — footer with contact info
+- src/lib/data/studio.ts — single source of truth for hours, phone, address
+
+When the user asks about a page (e.g. "the classes page"), look in
+src/app/(public)/<page>/page.tsx. When they reference contact info,
+phone, or hours, prefer editing src/lib/data/studio.ts so the change
+flows everywhere it's used.
 
 ## About NDCE
 - Family-oriented dance studio in Lutz, FL
