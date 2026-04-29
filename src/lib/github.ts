@@ -65,7 +65,9 @@ export async function listFiles(path: string = 'src'): Promise<GitHubFile[]> {
   const files: GitHubFile[] = []
 
   for (const item of items) {
-    if (item.type === 'file' && /\.(tsx?|jsx?|json)$/.test(item.name)) {
+    // Include source code, styles, and markdown so the assistant can find
+    // CSS classes (e.g. .btn-primary in globals.css) and content files.
+    if (item.type === 'file' && /\.(tsx?|jsx?|json|css|scss|md|mdx)$/.test(item.name)) {
       files.push(item)
     } else if (item.type === 'dir' && !['node_modules', '.next', '.git'].includes(item.name)) {
       const subFiles = await listFiles(item.path)

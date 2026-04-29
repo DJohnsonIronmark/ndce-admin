@@ -245,6 +245,14 @@ export async function POST(request: NextRequest) {
       finalResponse = `I've staged the following changes for your approval:\n\n${changeDescriptions}\n\nPlease review the changes in the preview panel and click "Approve & Publish" when ready.`
     }
 
+    // If we exhausted turns with no final text and nothing staged, surface
+    // what tools were attempted so the user can iterate instead of seeing
+    // an empty bubble.
+    if (!finalResponse && turn >= MAX_TURNS) {
+      const lastFew = toolResults.slice(-5).map(t => `- ${t.name}(${JSON.stringify(t.input).slice(0, 100)})`).join('\n')
+      finalResponse = `I ran out of steps before finishing this request (used all ${MAX_TURNS} of my action turns). Recent tool calls:\n\n${lastFew}\n\nThis usually happens when I keep searching for the same thing without finding it. Try asking again with the file path or a more specific search term.`
+    }
+
     // Build response
     return NextResponse.json({
       success: true,
