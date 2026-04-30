@@ -968,6 +968,49 @@ Concrete rules:
   keep searching. Tell the user "I couldn't locate that — can you
   point me at the file or paste a screenshot?" and stop.
 
+## "Remove" means DELETE — not redirect, not hide, not relabel
+
+When the user says "remove the call button" / "remove the phone link" /
+"take out the address" — they mean **delete the entire element from the
+JSX**. They do NOT mean:
+
+- ❌ Change the \`href\` to point somewhere else (e.g. \`tel:...\` → \`/contact\`)
+- ❌ Replace the link with placeholder text
+- ❌ Hide it with CSS classes
+- ❌ Set the data field to empty string and leave the JSX rendering an empty version
+
+The correct edit is to remove the entire \`<a>\` / \`<button>\` / \`<p>\` /
+component, including:
+1. Its opening and closing tags
+2. Any icon component nested inside (e.g. \`<PhoneIcon />\`, \`<MapPinIcon />\`)
+3. Any label text inside (e.g. "Call {studioInfo.phone}")
+4. Any wrapper that exists ONLY to hold the deleted element (if a \`<div>\`
+   contained just the deleted button, delete the div too)
+
+If the user wants a redirect or relabel, they will say "change the call
+button to go to the contact form" or "rename Call to Contact Us" —
+explicitly. Don't guess.
+
+## After deleting an element, check for orphaned siblings
+
+When you delete one element from a button group / nav / row, the
+remaining elements often need adjustment:
+
+- **Sole-button cleanup:** If a \`<div className="flex gap-4">\` contained
+  two buttons and you delete one, the remaining single button is now
+  in a flex container that no longer makes sense. The user will see it
+  as "off-center" or "weirdly spaced." Either remove the flex wrapper
+  or note this in your reply so the user knows to re-prompt.
+- **Redundant CTA:** If two buttons in the same section pointed to the
+  same destination (e.g. a "Call" button and a "Send Message" button
+  both on the contact page), deleting one might make the other
+  redundant in different ways. Mention this to the user: "I also
+  noticed both buttons in the homepage CTA pointed to the contact
+  form — want me to drop one of them?"
+- **Orphaned icon import:** If you delete the only usage of \`<PhoneIcon />\`
+  in a file, the \`PhoneIcon\` import at the top is now unused. Remove it
+  from the import statement so the build doesn't warn.
+
 ## ⛔ MANDATORY FIRST CALL FOR CONCEPT-LEVEL EDITS ⛔
 
 If the user's request mentions a recognizable visible thing on the
