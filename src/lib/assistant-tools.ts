@@ -350,7 +350,7 @@ export async function executeTool(
         if (data.matchCount === 0) {
           return `No matches found for "${findText}". No changes were made.`
         }
-        const summary = `✅ **Find & Replace - STAGED (NOT LIVE)**\n\nReplaced ${data.matchCount} occurrence(s) in ${data.filesAffected} file(s).\n\n**Staging ID:** ${data.stagingId || 'N/A'}\n\n⚠️ **IMPORTANT:** These changes are in the staging area only. They will NOT appear on the website until the user clicks "Approve & Publish" in the right panel.\n\n📋 Tell the user: "I've staged these changes. Please click 'Approve & Publish' to make them live."`
+        const summary = `✅ **Find & Replace - STAGED (NOT LIVE)**\n\nReplaced ${data.matchCount} occurrence(s) in ${data.filesAffected} file(s).\n\n**Staging ID:** ${data.stagingId || 'N/A'}\n\n⚠️ **IMPORTANT:** These changes are in the staging area only. They will NOT appear on the website until the user clicks Preview, reviews the staging deployment, then clicks Publish to Live.\n\n📋 Tell the user: "I've staged these changes. Please click Preview to build a staging deployment, then Publish to Live to push it."`
         // Embed prepared file contents so the route can pass them directly to publish,
         // bypassing the in-memory staging store that doesn't survive serverless cold starts.
         if (Array.isArray(data.files) && data.files.length > 0) {
@@ -520,7 +520,7 @@ export async function executeTool(
 
           if (data.success) {
             const action = sha ? 'updated' : 'created'
-            return `✅ **File ${action} - STAGED (NOT LIVE)**\n\n**Path:** ${path}\n**Description:** ${description}\n**Lines:** ${content.split('\n').length}\n**Staging ID:** ${data.stagingId || 'N/A'}\n\n⚠️ **IMPORTANT:** This change is in the staging area only. It will NOT appear on the website until the user clicks "Approve & Publish" in the right panel.\n\n📋 Tell the user: "I've staged these changes. Please click 'Approve & Publish' to make them live."`
+            return `✅ **File ${action} - STAGED (NOT LIVE)**\n\n**Path:** ${path}\n**Description:** ${description}\n**Lines:** ${content.split('\n').length}\n**Staging ID:** ${data.stagingId || 'N/A'}\n\n⚠️ **IMPORTANT:** This change is in the staging area only. It will NOT appear on the website until the user clicks Preview, reviews the staging deployment, then clicks Publish to Live.\n\n📋 Tell the user: "I've staged these changes. Please click Preview to build a staging deployment, then Publish to Live to push it."`
           } else {
             return `Failed to stage file write: ${data.message || 'Unknown error'}`
           }
@@ -601,7 +601,7 @@ export async function executeTool(
           const data = await response.json()
 
           if (data.success) {
-            const summary = `✅ **File Edit - STAGED (NOT LIVE)**\n\n**Path:** ${path}\n**Description:** ${description}\n**Staging ID:** ${data.stagingId || 'N/A'}\n\n**Change Preview:**\n- Removed: \`${oldContent.substring(0, 100)}${oldContent.length > 100 ? '...' : ''}\`\n- Added: \`${newContent.substring(0, 100)}${newContent.length > 100 ? '...' : ''}\`\n\n⚠️ **IMPORTANT:** This change is in the staging area only. It will NOT appear on the website until the user clicks "Approve & Publish" in the right panel.\n\n📋 Tell the user: "I've staged these changes. Please click 'Approve & Publish' to make them live."`
+            const summary = `✅ **File Edit - STAGED (NOT LIVE)**\n\n**Path:** ${path}\n**Description:** ${description}\n**Staging ID:** ${data.stagingId || 'N/A'}\n\n**Change Preview:**\n- Removed: \`${oldContent.substring(0, 100)}${oldContent.length > 100 ? '...' : ''}\`\n- Added: \`${newContent.substring(0, 100)}${newContent.length > 100 ? '...' : ''}\`\n\n⚠️ **IMPORTANT:** This change is in the staging area only. It will NOT appear on the website until the user clicks Preview, reviews the staging deployment, then clicks Publish to Live.\n\n📋 Tell the user: "I've staged these changes. Please click Preview to build a staging deployment, then Publish to Live to push it."`
             // Pass the full updated content via staging payload so the publish call
             // can commit directly without depending on the in-memory store.
             return `${summary}\n\n<staging_payload>${JSON.stringify({ files: [{ path, newContent: updatedContent, sha: sha || '' }] })}</staging_payload>`
@@ -718,8 +718,9 @@ When you use write_file, edit_file, or apply_find_replace:
 
 **YOU MUST ALWAYS SAY:**
 - ✅ "I've STAGED these changes for your review"
-- ✅ "Click 'Approve & Publish' in the panel on the right to make these live"
-- ✅ "The changes are ready for your approval but NOT yet on the website"
+- ✅ "Click **Preview** in the panel on the right — you'll get a live preview URL of the site WITH these changes applied"
+- ✅ "Once the preview looks right, click **Publish to Live** to push it to the production site"
+- ✅ "The changes are ready for your approval but NOT yet on the live site"
 
 This is extremely important - users get confused when told something is live but they can't see it.
 
@@ -745,6 +746,61 @@ Concrete rules:
 - If you can't find what the user described after 2 searches, do not
   keep searching. Tell the user "I couldn't locate that — can you
   point me at the file or paste a screenshot?" and stop.
+
+## Speak human — the user is a non-technical small-business owner
+
+Nicole runs a dance studio. She does NOT know what a component is, what a
+JSX file is, or what JSON-LD / structured data / schema markup is. She
+will describe what she SEES on the page, not the file that renders it.
+
+Your job is to translate her words into the full set of technical edits
+required, AND to do them all in one pass. Never make her ask for the
+"technical" parts separately.
+
+### Translation table — what visible things actually touch
+
+| User says | You must edit |
+| --- | --- |
+| "the call button" / "click-to-call" / "the phone number link" | Every \`<a href="tel:...">\` across the site (homepage CTA, schedule, classes, contact, footer) AND \`telephone\` fields in StructuredData.tsx AND \`studioInfo.phone\` in studio.ts (set to "" or remove) |
+| "the phone number" | Same as above |
+| "the logo" | Every \`<Image src=...>\` referencing the logo, the favicon in app/layout, and og:image / Twitter card images in metadata |
+| "the address" | \`studioInfo.address.*\` AND any \`address\` fields in StructuredData.tsx AND any hardcoded address strings in pages |
+| "the studio hours" | \`studioInfo.hours\` AND any \`openingHours\` in StructuredData.tsx AND any hours rendered statically in pages |
+| "the email" | \`studioInfo.email\` AND any \`mailto:\` links AND \`email\` field in StructuredData.tsx |
+| "the studio name" | \`studioInfo.name\` AND \`name\` in StructuredData.tsx AND \`<title>\` and metadata.title in app/layout |
+| "the navigation" / "the menu" | Header.tsx (and any mobile nav variant) |
+
+### Discovery rules — find ALL of it before editing ANYTHING
+
+1. Treat the user's LOCATION words ("in the footer", "on the homepage",
+   "next to the schedule") as HINTS, NOT constraints. The actual element
+   she's seeing might be rendered from a different file.
+
+2. For ANY remove/replace/update request that touches a recognizable
+   visible element (button, link, image, section, contact info, hours):
+   START with search_source_code across the WHOLE codebase. Find every
+   instance. Only then plan the edits.
+
+3. If you find more than one occurrence, list them in your reply BEFORE
+   making any edit_file call:
+
+   > "Removing the call-to-action phone button — I see it in 5 places:
+   > Homepage CTA, Schedule page, Classes page, Contact page, Footer,
+   > and the structured-data block that tells Google our phone number.
+   > I'll remove all six in one preview."
+
+4. Then make all the edits as a single staged change set — Nicole will
+   click Preview ONCE and see every change at once. Never partial-edit
+   "the footer one" while leaving the homepage CTA alone — that produces
+   a half-finished site she can see is broken.
+
+5. Schema / SEO / structured data updates are AUTOMATIC side effects of
+   visible-element edits. NEVER ask "do you also want to update the
+   structured data?" — Nicole doesn't know what that is. Just include
+   it in the same change set and mention it briefly:
+
+   > "...and I updated the search-engine info so Google won't show the
+   > old phone number anymore."
 
 ## Picking the right tool for the request
 
@@ -831,15 +887,18 @@ flows everywhere it's used.
 After making changes with write_file, edit_file, or apply_find_replace, ALWAYS end with this format:
 
 "I've **STAGED** the following changes for your review:
-- [List each file modified]
+- [List each user-visible thing that changed in plain language — e.g. 'Removed the call button from the homepage, schedule page, classes page, contact page, and footer' — NOT a list of file paths]
 
-⚠️ **These changes are NOT live yet.** They are in the staging area waiting for your approval.
+⚠️ **These changes are NOT live yet.**
 
-👉 **Next step:** Click the **'Approve & Publish'** button in the panel on the right to make these changes live on your website."
+👉 **Next steps:**
+1. Click **Preview** in the panel on the right — Vercel will build a temporary preview of the site with these changes (~30–60s)
+2. Open the preview link, click around, make sure it looks right
+3. Click **Publish to Live** to push to the real site, or **Discard** to throw it away"
 
 ⛔ **NEVER say:**
 - "Changes are live" or "published" or "deployed"
 - "Your website has been updated"
 - The rocket emoji 🚀 with claims of publishing
 
-The user MUST click "Approve & Publish" - until then, nothing has changed on the actual website.`
+The user MUST click Preview, then Publish to Live — until then, nothing has changed on the actual website.`
