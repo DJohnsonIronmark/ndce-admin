@@ -29,6 +29,205 @@ function buildServiceHeaders(extra?: HeadersInit): Headers {
   return headers
 }
 
+// ============================================================================
+// find_visible_concept — deterministic discovery for "remove X" / "update X"
+//
+// The model is unreliable at remembering to check every page when a user says
+// something like "remove the call button". This tool runs a fixed set of
+// searches per concept, aggregates the hits, and returns them grouped by the
+// kind of artifact (visible JSX vs. SEO/schema vs. data source). The system
+// prompt forces the bot to call this BEFORE editing for any request that
+// targets a known concept, so the edit-set is computed by code rather than by
+// LLM reasoning.
+// ============================================================================
+
+type HitKind =
+  | 'visible_link'   // <a href="tel:"> etc — what the user sees and clicks
+  | 'visible_text'   // hardcoded user-facing strings
+  | 'data_source'    // studioInfo.X reference — flows everywhere
+  | 'schema_data'    // JSON-LD / metadata — invisible but tells search engines
+
+interface ConceptSearch {
+  pattern: string
+  kind: HitKind
+  why: string
+}
+
+interface ConceptDef {
+  display: string             // human-readable name shown to user
+  aliases: string[]           // alternate keys the bot might pass
+  searches: ConceptSearch[]
+}
+
+// Each concept lists the literal substrings to grep for and what each match
+// represents. Patterns are intentionally narrow (URL prefixes, exact field
+// names, hardcoded literals) so we minimize false positives — the bot has to
+// trust this list completely.
+const CONCEPTS: Record<string, ConceptDef> = {
+  call_button: {
+    display: 'click-to-call button / phone number',
+    aliases: ['phone_number', 'phone', 'call_link', 'click_to_call', 'tel'],
+    searches: [
+      { pattern: 'tel:', kind: 'visible_link', why: 'Renders a click-to-call link in the page' },
+      { pattern: 'studioInfo.phone', kind: 'data_source', why: 'References the studio phone number' },
+      { pattern: 'telephone:', kind: 'schema_data', why: 'Schema field that tells Google the phone number' },
+    ],
+  },
+  email: {
+    display: 'studio email link',
+    aliases: ['email_link', 'mailto', 'contact_email'],
+    searches: [
+      { pattern: 'mailto:', kind: 'visible_link', why: 'Renders a clickable email link' },
+      { pattern: 'studioInfo.email', kind: 'data_source', why: 'References the studio email' },
+      { pattern: 'nicolesdancecenter@gmail.com', kind: 'visible_text', why: 'Hardcoded email text on the page' },
+      { pattern: 'email:', kind: 'schema_data', why: 'Schema field that tells Google the email' },
+    ],
+  },
+  address: {
+    display: 'studio address',
+    aliases: ['location', 'street_address'],
+    searches: [
+      { pattern: 'studioInfo.address', kind: 'data_source', why: 'References the studio address' },
+      { pattern: '17743 Hunting Bow', kind: 'visible_text', why: 'Hardcoded street address text' },
+      { pattern: 'streetAddress', kind: 'schema_data', why: 'Schema street field that Google reads' },
+      { pattern: 'addressLocality', kind: 'schema_data', why: 'Schema city field that Google reads' },
+    ],
+  },
+  hours: {
+    display: 'studio operating hours',
+    aliases: ['operating_hours', 'studio_hours', 'opening_hours'],
+    searches: [
+      { pattern: 'studioInfo.hours', kind: 'data_source', why: 'References hours from the studio data' },
+      { pattern: 'openingHours', kind: 'schema_data', why: 'Schema field that tells Google when the studio is open' },
+    ],
+  },
+  studio_name: {
+    display: 'studio name',
+    aliases: ['business_name', 'name'],
+    searches: [
+      { pattern: 'studioInfo.name', kind: 'data_source', why: 'References the studio name' },
+      { pattern: "Nicole's Dance Center Elite", kind: 'visible_text', why: 'Hardcoded full studio name' },
+      { pattern: 'NDCE', kind: 'visible_text', why: 'Studio short name' },
+    ],
+  },
+  logo: {
+    display: 'studio logo',
+    aliases: ['brand_logo', 'site_logo'],
+    searches: [
+      { pattern: 'nicoles-dance-elite-logo', kind: 'visible_link', why: 'Logo image file reference' },
+      { pattern: 'favicon', kind: 'schema_data', why: 'Browser tab icon' },
+      { pattern: 'og:image', kind: 'schema_data', why: 'Image shown when the site is shared on social media' },
+    ],
+  },
+}
+
+function resolveConcept(input: string): { key: string; def: ConceptDef } | null {
+  const norm = input.toLowerCase().replace(/[\s\-]+/g, '_')
+  if (CONCEPTS[norm]) return { key: norm, def: CONCEPTS[norm] }
+  for (const [key, def] of Object.entries(CONCEPTS)) {
+    if (def.aliases.includes(norm)) return { key, def }
+  }
+  return null
+}
+
+interface AggregatedHit {
+  file: string
+  line: number
+  snippet: string
+  kind: HitKind
+  why: string
+}
+
+async function findVisibleConcept(input: string): Promise<string> {
+  const resolved = resolveConcept(input)
+  if (!resolved) {
+    const known = Object.keys(CONCEPTS).join(', ')
+    return `Unknown concept "${input}". Known concepts: ${known}.\n\nIf the user is asking about something not in this list, fall back to search_source_code with a specific literal string they mentioned. Do NOT free-associate — search only for things you can verify exist.`
+  }
+
+  const { def } = resolved
+  // Run all searches in parallel for speed.
+  const searchResults = await Promise.all(
+    def.searches.map(async (s) => {
+      try {
+        const matches = await searchInFiles(s.pattern, false)
+        return matches.map((m) => ({
+          file: m.path,
+          line: m.line,
+          snippet: m.content.trim().substring(0, 140),
+          kind: s.kind,
+          why: s.why,
+        } as AggregatedHit))
+      } catch {
+        return []
+      }
+    }),
+  )
+
+  // Flatten + dedupe (file:line keys). Skip backup folders — those are stale
+  // copies that the platform repo keeps for safety; editing them would do
+  // nothing on the live site and would confuse the bot.
+  const seen = new Set<string>()
+  const hits: AggregatedHit[] = []
+  for (const group of searchResults) {
+    for (const hit of group) {
+      if (hit.file.startsWith('backups/')) continue
+      const key = `${hit.file}:${hit.line}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      hits.push(hit)
+    }
+  }
+
+  if (hits.length === 0) {
+    return `No references found for "${def.display}". Either the concept is already removed or the user is describing something else. Ask them to clarify with a screenshot or specific page name.`
+  }
+
+  // Group by kind so the bot sees the structure (visible vs data vs schema).
+  const byKind: Record<HitKind, AggregatedHit[]> = {
+    visible_link: [],
+    visible_text: [],
+    data_source: [],
+    schema_data: [],
+  }
+  for (const h of hits) byKind[h.kind].push(h)
+
+  const sections: string[] = []
+  const order: Array<[HitKind, string]> = [
+    ['visible_link', 'VISIBLE links / buttons (these are what the user sees)'],
+    ['visible_text', 'VISIBLE hardcoded text'],
+    ['data_source', 'DATA SOURCE (changing this propagates everywhere)'],
+    ['schema_data', 'SEARCH-ENGINE DATA (invisible but tells Google)'],
+  ]
+  for (const [kind, label] of order) {
+    if (byKind[kind].length === 0) continue
+    sections.push(`### ${label}`)
+    for (const h of byKind[kind]) {
+      sections.push(`- **${h.file}:${h.line}** — ${h.why}\n  \`${h.snippet}\``)
+    }
+  }
+
+  const fileCount = new Set(hits.map((h) => h.file)).size
+
+  return [
+    `## Discovery: ${def.display}`,
+    ``,
+    `Found **${hits.length} reference(s) across ${fileCount} file(s)** that you must edit to fully complete this request.`,
+    ``,
+    sections.join('\n'),
+    ``,
+    `---`,
+    `### What you MUST do next`,
+    ``,
+    `1. Read each file in the list above (use read_file)`,
+    `2. Stage an edit_file for each one — the user will see one combined preview`,
+    `3. DO NOT respond to the user with "I've staged the change" until every entry above has a corresponding edit_file or apply_find_replace call.`,
+    `4. If a file appears here that you don't intend to touch, you MUST explain why in your final reply.`,
+    ``,
+    `Half-finished edit-sets are worse than nothing — Nicole will see a half-broken site (e.g. one call button removed, four still live). Be exhaustive.`,
+  ].join('\n')
+}
+
 export const ASSISTANT_TOOLS: Anthropic.Tool[] = [
   {
     name: 'review_website',
@@ -101,6 +300,20 @@ export const ASSISTANT_TOOLS: Anthropic.Tool[] = [
         },
       },
       required: ['searchText'],
+    },
+  },
+  {
+    name: 'find_visible_concept',
+    description: 'REQUIRED before any "remove X" or "update X" request that targets a recognizable visible element of the website (call button, phone number, email link, address, hours, studio name, logo). Returns the COMPLETE list of code locations you must edit to fully satisfy the request — across visible JSX, hardcoded text, data sources, and search-engine schema. Use this instead of guessing or relying on the user\'s location words. After calling this, you must edit every entry in the result.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        concept: {
+          type: 'string',
+          description: 'A canonical concept name. Supported: call_button, phone_number, email, address, hours, studio_name, logo. (Synonyms like "phone", "click_to_call", "mailto", "location", "operating_hours", "business_name", "brand_logo" are also accepted.)',
+        },
+      },
+      required: ['concept'],
     },
   },
   {
@@ -374,6 +587,14 @@ export async function executeTool(
           result += `- **${match.relativePath}:${match.line}** - ${match.content?.substring(0, 100) || match.before?.substring(0, 100)}...\n`
         }
         return result
+      }
+
+      case 'find_visible_concept': {
+        const { concept } = toolInput as { concept: string }
+        if (!concept) {
+          return `Error: "concept" parameter is required. Supported concepts: ${Object.keys(CONCEPTS).join(', ')}.`
+        }
+        return await findVisibleConcept(concept)
       }
 
       case 'get_staged_changes': {
@@ -746,6 +967,39 @@ Concrete rules:
 - If you can't find what the user described after 2 searches, do not
   keep searching. Tell the user "I couldn't locate that — can you
   point me at the file or paste a screenshot?" and stop.
+
+## ⛔ MANDATORY FIRST CALL FOR CONCEPT-LEVEL EDITS ⛔
+
+If the user's request mentions a recognizable visible thing on the
+website — a call/phone button, an email link, the studio address,
+operating hours, the studio name, or the logo — your FIRST tool call
+**MUST** be \`find_visible_concept\` with the matching concept key.
+Examples:
+
+| User says | First tool call |
+| --- | --- |
+| "remove the call button from the footer" | \`find_visible_concept({concept: "call_button"})\` |
+| "the studio email changed to ..." | \`find_visible_concept({concept: "email"})\` |
+| "we moved — new address is ..." | \`find_visible_concept({concept: "address"})\` |
+| "update the hours" | \`find_visible_concept({concept: "hours"})\` |
+| "rebrand the studio name to ..." | \`find_visible_concept({concept: "studio_name"})\` |
+| "swap the logo to this image" | \`find_visible_concept({concept: "logo"})\` |
+
+The tool returns the COMPLETE list of files you must touch, grouped
+into visible JSX, hardcoded text, data sources, and search-engine
+schema. **You may not stage your final edit set until every entry on
+that list has a corresponding edit_file or apply_find_replace call.**
+
+Do NOT skip this tool because you "already know where the call button
+is" or because the user named a single page. The user will name one
+page; the bot will edit one page; the site will be left half-broken
+in five other places. find_visible_concept is the only thing
+preventing that failure mode.
+
+If the user asks for something not covered by find_visible_concept
+(e.g. "add a new section", "change the button color"), you don't need
+to call it — proceed normally with search_source_code / read_file /
+edit_file.
 
 ## Speak human — the user is a non-technical small-business owner
 

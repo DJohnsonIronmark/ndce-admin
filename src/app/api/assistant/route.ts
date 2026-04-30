@@ -112,6 +112,10 @@ function toolLabel(name: string, input: unknown): string {
       return typeof i.componentName === 'string' ? `Looking up ${i.componentName}` : 'Looking up component'
     case 'create_task_list':
       return 'Building task list'
+    case 'find_visible_concept':
+      return typeof i.concept === 'string'
+        ? `Finding every "${i.concept}" reference`
+        : 'Finding all references'
     default:
       return name
   }
