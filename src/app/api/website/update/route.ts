@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { readFile, writeFile } from 'fs/promises'
 import { join } from 'path'
+import { requireSessionOrServiceToken } from '@/lib/session'
 
 interface UpdateRequest {
   section: string
@@ -32,6 +33,11 @@ const SECTION_MARKERS: Record<string, { start: string; end: string }> = {
 }
 
 export async function POST(request: NextRequest) {
+  const auth = await requireSessionOrServiceToken(request)
+  if (!auth.ok) {
+    return NextResponse.json({ error: 'Authentication required' }, { status: 401 })
+  }
+
   try {
     const body: UpdateRequest = await request.json()
     const { section, content, backup = true } = body

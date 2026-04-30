@@ -17,6 +17,18 @@ function getStagedFileContent(path: string): string | null {
   return null
 }
 
+// Build a Headers object that carries the X-Service-Token so internal
+// /api/website/* calls authenticate themselves to the new auth guard.
+// The token is set in Vercel as WEBSITE_SERVICE_TOKEN. If the env var
+// isn't configured the header is simply omitted — useful for local dev
+// where the routes aren't gated.
+function buildServiceHeaders(extra?: HeadersInit): Headers {
+  const headers = new Headers(extra)
+  const token = process.env.WEBSITE_SERVICE_TOKEN
+  if (token) headers.set('X-Service-Token', token)
+  return headers
+}
+
 export const ASSISTANT_TOOLS: Anthropic.Tool[] = [
   {
     name: 'review_website',
@@ -250,7 +262,7 @@ export async function executeTool(
       case 'review_website': {
         const response = await fetch(`${baseUrl}/api/website/verify`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: buildServiceHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({ mode: 'review' }),
         })
         const data = await response.json()
@@ -289,7 +301,7 @@ export async function executeTool(
         const { searchText } = toolInput as { searchText: string }
         const response = await fetch(`${baseUrl}/api/website/verify`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: buildServiceHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({ searchText, mode: 'search' }),
         })
         const data = await response.json()
@@ -304,7 +316,7 @@ export async function executeTool(
         const { findText, replaceText } = toolInput as { findText: string; replaceText: string }
         const response = await fetch(`${baseUrl}/api/website/find-replace`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: buildServiceHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({ find: findText, replace: replaceText, preview: true }),
         })
         const data = await response.json()
@@ -328,7 +340,7 @@ export async function executeTool(
         const { findText, replaceText } = toolInput as { findText: string; replaceText: string }
         const response = await fetch(`${baseUrl}/api/website/find-replace`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: buildServiceHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({ find: findText, replace: replaceText, preview: false }),
         })
         const data = await response.json()
@@ -349,7 +361,9 @@ export async function executeTool(
 
       case 'search_source_code': {
         const { searchText } = toolInput as { searchText: string }
-        const response = await fetch(`${baseUrl}/api/website/find-replace?q=${encodeURIComponent(searchText)}`)
+        const response = await fetch(`${baseUrl}/api/website/find-replace?q=${encodeURIComponent(searchText)}`, {
+          headers: buildServiceHeaders(),
+        })
         const data = await response.json()
         if (!data.success || data.matchCount === 0) {
           return `No matches found for "${searchText}" in the source code.`
@@ -363,7 +377,9 @@ export async function executeTool(
       }
 
       case 'get_staged_changes': {
-        const response = await fetch(`${baseUrl}/api/website/publish`)
+        const response = await fetch(`${baseUrl}/api/website/publish`, {
+          headers: buildServiceHeaders(),
+        })
         const data = await response.json()
         if (!data.hasChanges) {
           return 'No changes are currently staged for approval.'
@@ -490,7 +506,7 @@ export async function executeTool(
           // Stage the write operation
           const response = await fetch(`${baseUrl}/api/website/file-operation`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: buildServiceHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({
               operation: 'write',
               path,
@@ -570,7 +586,7 @@ export async function executeTool(
           // Stage the edit operation
           const response = await fetch(`${baseUrl}/api/website/file-operation`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: buildServiceHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({
               operation: 'edit',
               path,

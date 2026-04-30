@@ -5,6 +5,7 @@ import { exec } from 'child_process'
 import { promisify } from 'util'
 import { findAndReplace as githubFindAndReplace, isGitHubAvailable, searchInFiles, prepareChangesForStaging } from '@/lib/github'
 import { stageChanges, type StagedFile } from '@/lib/github-staging'
+import { requireSessionOrServiceToken } from '@/lib/session'
 
 const execAsync = promisify(exec)
 
@@ -348,6 +349,11 @@ async function handleLocalFindReplace(body: FindReplaceRequest) {
 }
 
 export async function POST(request: NextRequest) {
+  const auth = await requireSessionOrServiceToken(request)
+  if (!auth.ok) {
+    return NextResponse.json({ error: 'Authentication required' }, { status: 401 })
+  }
+
   try {
     const body: FindReplaceRequest = await request.json()
     const { find } = body
@@ -380,6 +386,11 @@ export async function POST(request: NextRequest) {
 
 // GET endpoint to search for text
 export async function GET(request: NextRequest) {
+  const auth = await requireSessionOrServiceToken(request)
+  if (!auth.ok) {
+    return NextResponse.json({ error: 'Authentication required' }, { status: 401 })
+  }
+
   const searchParams = request.nextUrl.searchParams
   const query = searchParams.get('q')
 

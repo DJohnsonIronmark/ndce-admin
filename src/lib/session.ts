@@ -97,3 +97,35 @@ export async function requireSession(request: Request): Promise<SessionPayload |
   const token = decodeURIComponent(match[1])
   return await verifySession(token, secret)
 }
+
+// Constant-time string compare for secrets. Same length is enforced
+// before the loop runs so we never leak length via early return timing.
+function timingSafeStringEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false
+  let diff = 0
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  return diff === 0
+}
+
+// Service auth used for server-to-server calls inside the admin app
+// (e.g. /api/assistant calling /api/website/find-replace). Returns
+// true when the request carries the configured WEBSITE_SERVICE_TOKEN
+// in the X-Service-Token header.
+export function hasValidServiceToken(request: Request): boolean {
+  const expected = process.env.WEBSITE_SERVICE_TOKEN
+  if (!expected) return false
+  const provided = request.headers.get('x-service-token')
+  if (!provided) return false
+  return timingSafeStringEqual(provided, expected)
+}
+
+// Combined guard: either a valid admin session OR a matching service
+// token. Routes that are called both from the browser (cookie) and
+// from inside other routes (token) should use this so they accept
+// both legit callers without exposing themselves to the public.
+export async function requireSessionOrServiceToken(request: Request): Promise<{ ok: true; via: 'session' | 'service-token' } | { ok: false }> {
+  if (hasValidServiceToken(request)) return { ok: true, via: 'service-token' }
+  const session = await requireSession(request)
+  if (session) return { ok: true, via: 'session' }
+  return { ok: false }
+}

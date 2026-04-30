@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { requireSessionOrServiceToken } from '@/lib/session'
 
 interface VerifyRequest {
   searchText?: string
@@ -229,6 +230,11 @@ function searchForText(content: string, searchText: string): TextMatch | null {
 }
 
 export async function POST(request: NextRequest) {
+  const auth = await requireSessionOrServiceToken(request)
+  if (!auth.ok) {
+    return NextResponse.json({ error: 'Authentication required' }, { status: 401 })
+  }
+
   try {
     const body: VerifyRequest = await request.json()
     const { searchText, url = NDCE_WEBSITE_URL, mode = 'search' } = body
@@ -288,6 +294,11 @@ export async function POST(request: NextRequest) {
 
 // GET endpoint for quick verification checks
 export async function GET(request: NextRequest) {
+  const auth = await requireSessionOrServiceToken(request)
+  if (!auth.ok) {
+    return NextResponse.json({ error: 'Authentication required' }, { status: 401 })
+  }
+
   const searchParams = request.nextUrl.searchParams
   const q = searchParams.get('q')
   const mode = searchParams.get('mode')
