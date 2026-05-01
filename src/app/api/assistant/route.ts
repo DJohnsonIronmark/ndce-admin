@@ -79,6 +79,56 @@ type ContentBlock = Anthropic.ContentBlock
 type ToolUseBlock = Anthropic.ToolUseBlock
 type TextBlock = Anthropic.TextBlock
 
+// Build a short, human-readable label for the tool the model is about to
+// run, e.g. "Editing Header.tsx" or "Searching for 'Register Now'".
+// The client surfaces this in place of a static "Thinking..." indicator.
+function toolLabel(name: string, input: unknown): string {
+  const i = (input || {}) as Record<string, unknown>
+  const filename = (p?: unknown): string | undefined =>
+    typeof p === 'string' ? p.split('/').pop() : undefined
+  switch (name) {
+    case 'search_source_code': {
+      const q = i.query || i.text || i.searchText
+      return q ? `Searching for "${String(q).slice(0, 40)}"` : 'Searching code'
+    }
+    case 'list_files':
+      return typeof i.path === 'string' ? `Listing ${i.path}` : 'Listing files'
+    case 'read_file':
+      return filename(i.path) ? `Reading ${filename(i.path)}` : 'Reading file'
+    case 'edit_file':
+      return filename(i.path) ? `Editing ${filename(i.path)}` : 'Editing file'
+    case 'write_file':
+      return filename(i.path) ? `Creating ${filename(i.path)}` : 'Creating file'
+    case 'apply_find_replace':
+      return typeof i.findText === 'string'
+        ? `Replacing "${String(i.findText).slice(0, 40)}"`
+        : 'Replacing text'
+    case 'preview_find_replace':
+      return 'Previewing replace'
+    case 'search_website':
+    case 'review_website':
+      return 'Reviewing website'
+    case 'get_component_info':
+      return typeof i.componentName === 'string' ? `Looking up ${i.componentName}` : 'Looking up component'
+    case 'create_task_list':
+      return 'Building task list'
+    case 'find_visible_concept':
+      return typeof i.concept === 'string'
+        ? `Finding every "${i.concept}" reference`
+        : 'Finding all references'
+    case 'delete_jsx_element': {
+      const p = typeof i.path === 'string' ? i.path.split('/').pop() : undefined
+      return p ? `Deleting element in ${p}` : 'Deleting element'
+    }
+    case 'remove_concept':
+      return typeof i.concept === 'string'
+        ? `Removing every ${String(i.concept).replace(/_/g, ' ')} from the site`
+        : 'Removing concept'
+    default:
+      return name
+  }
+}
+
 export async function POST(request: NextRequest) {
   try {
     // Require an authenticated admin session — this endpoint spends
@@ -137,183 +187,253 @@ export async function POST(request: NextRequest) {
       content: fullMessage,
     })
 
-    // Agentic loop - keep calling Claude until it doesn't use any tools
-    let turn = 0
-    const toolResults: Array<{ name: string; input: unknown; result: string }> = []
-    let finalResponse = ''
-    let taskList: unknown = null
-    const stagedChanges: StagedChangeFromTool[] = []
-
-    while (turn < MAX_TURNS) {
-      turn++
-
-      // Call Claude with tools
-      const response = await anthropic.messages.create({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 4096,
-        system: AGENTIC_SYSTEM_PROMPT,
-        tools: ASSISTANT_TOOLS,
-        messages,
-      })
-
-      // Check if we should stop
-      if (response.stop_reason === 'end_turn') {
-        // Extract final text response
-        const textBlocks = response.content.filter(block => block.type === 'text') as TextBlock[]
-        finalResponse = textBlocks.map(b => b.text).join('\n')
-        break
-      }
-
-      // Process tool uses
-      const toolUseBlocks = response.content.filter(block => block.type === 'tool_use') as ToolUseBlock[]
-
-      if (toolUseBlocks.length === 0) {
-        // No tool use, extract text and finish
-        const textBlocks = response.content.filter(block => block.type === 'text') as TextBlock[]
-        finalResponse = textBlocks.map(b => b.text).join('\n')
-        break
-      }
-
-      // Execute each tool
-      const toolResultsForMessage: Anthropic.ToolResultBlockParam[] = []
-
-      for (const toolUse of toolUseBlocks) {
-        const rawResult = await executeTool(toolUse.name, toolUse.input as Record<string, unknown>, baseUrl)
-        let { cleaned: result, payload } = extractStagingPayload(rawResult)
-
-        // Stalled-loop nudge: if the agent has been doing recon-only calls
-        // for a while without producing a staged change, append a hint to
-        // the result so the model sees the prompt to commit.
-        const recentToolNames = toolResults.slice(-STALL_THRESHOLD).map(t => t.name)
-        const inRunOfRecon =
-          recentToolNames.length >= STALL_THRESHOLD &&
-          recentToolNames.every(n => RECON_TOOLS.has(n)) &&
-          stagedChanges.length === 0 &&
-          RECON_TOOLS.has(toolUse.name)
-        if (inRunOfRecon) {
-          result = `${result}\n\n---\n⚠️ **Coach note:** You've made ${recentToolNames.length} information-gathering calls in a row without staging a change. You almost certainly have enough context now. Your next action should be \`edit_file\` (preferred), \`write_file\`, or \`apply_find_replace\` — not another search or read. If you don't know what to edit, say so to the user instead of searching more.`
-        }
-
-        // Check if this is a task list creation
-        if (toolUse.name === 'create_task_list') {
+    // Stream SSE events while the agentic loop runs so the client can
+    // render live tool labels instead of a static "Thinking..." indicator.
+    const encoder = new TextEncoder()
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const send = (event: Record<string, unknown>) => {
           try {
-            const parsed = JSON.parse(result)
-            if (parsed.type === 'task_list') {
-              taskList = parsed.tasks
-            }
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`))
           } catch {
-            // Not a task list, continue normally
+            // Stream already closed (client disconnected). Swallow — the
+            // outer try/catch will still finish the loop.
           }
         }
 
-        // Check if this is a staged change from apply_find_replace
-        if (toolUse.name === 'apply_find_replace' && result.includes('STAGED (NOT LIVE)')) {
-          const input = toolUse.input as { findText?: string; replaceText?: string }
-          // Extract staging info from result (handles markdown formatting like **Staging ID:**)
-          const stagingIdMatch = result.match(/\*?\*?Staging ID:\*?\*?\s*(staged_\S+)/)
-          const matchCountMatch = result.match(/Replaced (\d+) occurrence/)
-          const filesMatch = result.match(/in (\d+) file/)
+        try {
+          send({ type: 'start' })
 
-          stagedChanges.push({
-            id: `staged-${Date.now()}-${stagedChanges.length}`,
-            type: 'find_replace',
-            title: 'Find & Replace',
-            description: `Replace "${input.findText}" with "${input.replaceText || '(remove)'}"`,
-            findText: input.findText,
-            replaceText: input.replaceText || '',
-            matchCount: matchCountMatch ? parseInt(matchCountMatch[1]) : 0,
-            filesAffected: filesMatch ? parseInt(filesMatch[1]) : 0,
-            stagingId: stagingIdMatch ? stagingIdMatch[1] : '',
-            files: payload?.files,
+          // Agentic loop - keep calling Claude until it doesn't use any tools
+          let turn = 0
+          const toolResults: Array<{ name: string; input: unknown; result: string }> = []
+          let finalResponse = ''
+          let taskList: unknown = null
+          const stagedChanges: StagedChangeFromTool[] = []
+
+          while (turn < MAX_TURNS) {
+            turn++
+            send({ type: 'turn', turn })
+
+            // Call Claude with tools
+            const response = await anthropic.messages.create({
+              model: 'claude-sonnet-4-20250514',
+              max_tokens: 4096,
+              system: AGENTIC_SYSTEM_PROMPT,
+              tools: ASSISTANT_TOOLS,
+              messages,
+            })
+
+            // Check if we should stop
+            if (response.stop_reason === 'end_turn') {
+              const textBlocks = response.content.filter(block => block.type === 'text') as TextBlock[]
+              finalResponse = textBlocks.map(b => b.text).join('\n')
+              break
+            }
+
+            // Process tool uses
+            const toolUseBlocks = response.content.filter(block => block.type === 'tool_use') as ToolUseBlock[]
+
+            if (toolUseBlocks.length === 0) {
+              const textBlocks = response.content.filter(block => block.type === 'text') as TextBlock[]
+              finalResponse = textBlocks.map(b => b.text).join('\n')
+              break
+            }
+
+            // Execute each tool
+            const toolResultsForMessage: Anthropic.ToolResultBlockParam[] = []
+
+            for (const toolUse of toolUseBlocks) {
+              send({
+                type: 'tool_start',
+                name: toolUse.name,
+                label: toolLabel(toolUse.name, toolUse.input),
+              })
+              const rawResult = await executeTool(toolUse.name, toolUse.input as Record<string, unknown>, baseUrl)
+              let { cleaned: result, payload } = extractStagingPayload(rawResult)
+
+              // Stalled-loop nudge: if the agent has been doing recon-only calls
+              // for a while without producing a staged change, append a hint to
+              // the result so the model sees the prompt to commit.
+              const recentToolNames = toolResults.slice(-STALL_THRESHOLD).map(t => t.name)
+              const inRunOfRecon =
+                recentToolNames.length >= STALL_THRESHOLD &&
+                recentToolNames.every(n => RECON_TOOLS.has(n)) &&
+                stagedChanges.length === 0 &&
+                RECON_TOOLS.has(toolUse.name)
+              if (inRunOfRecon) {
+                result = `${result}\n\n---\n⚠️ **Coach note:** You've made ${recentToolNames.length} information-gathering calls in a row without staging a change. You almost certainly have enough context now. Your next action should be \`edit_file\` (preferred), \`write_file\`, or \`apply_find_replace\` — not another search or read. If you don't know what to edit, say so to the user instead of searching more.`
+              }
+
+              // Check if this is a task list creation
+              if (toolUse.name === 'create_task_list') {
+                try {
+                  const parsed = JSON.parse(result)
+                  if (parsed.type === 'task_list') {
+                    taskList = parsed.tasks
+                  }
+                } catch {
+                  // Not a task list, continue normally
+                }
+              }
+
+              // Check if this is a staged change from apply_find_replace
+              if (toolUse.name === 'apply_find_replace' && result.includes('STAGED (NOT LIVE)')) {
+                const input = toolUse.input as { findText?: string; replaceText?: string }
+                const stagingIdMatch = result.match(/\*?\*?Staging ID:\*?\*?\s*(staged_\S+)/)
+                const matchCountMatch = result.match(/Replaced (\d+) occurrence/)
+                const filesMatch = result.match(/in (\d+) file/)
+
+                stagedChanges.push({
+                  id: `staged-${Date.now()}-${stagedChanges.length}`,
+                  type: 'find_replace',
+                  title: 'Find & Replace',
+                  description: `Replace "${input.findText}" with "${input.replaceText || '(remove)'}"`,
+                  findText: input.findText,
+                  replaceText: input.replaceText || '',
+                  matchCount: matchCountMatch ? parseInt(matchCountMatch[1]) : 0,
+                  filesAffected: filesMatch ? parseInt(filesMatch[1]) : 0,
+                  stagingId: stagingIdMatch ? stagingIdMatch[1] : '',
+                  files: payload?.files,
+                })
+              }
+
+              // Check if this is a staged file write
+              if (toolUse.name === 'write_file' && result.includes('STAGED (NOT LIVE)')) {
+                const input = toolUse.input as { path?: string; description?: string; content?: string }
+                const stagingIdMatch = result.match(/\*?\*?Staging ID:\*?\*?\s*(file-\S+)/)
+
+                stagedChanges.push({
+                  id: `staged-${Date.now()}-${stagedChanges.length}`,
+                  type: 'website_update',
+                  title: 'File Write',
+                  description: input.description || `Create/update ${input.path}`,
+                  section: input.path,
+                  content: input.content,
+                  stagingId: stagingIdMatch ? stagingIdMatch[1] : '',
+                })
+              }
+
+              // Check if this is a staged file edit
+              if (toolUse.name === 'edit_file' && result.includes('STAGED (NOT LIVE)')) {
+                const input = toolUse.input as { path?: string; description?: string; oldContent?: string; newContent?: string }
+                const stagingIdMatch = result.match(/\*?\*?Staging ID:\*?\*?\s*(file-\S+)/)
+                const fullContent = payload?.files?.[0]?.newContent
+
+                stagedChanges.push({
+                  id: `staged-${Date.now()}-${stagedChanges.length}`,
+                  type: 'website_update',
+                  title: 'File Edit',
+                  description: input.description || `Edit ${input.path}`,
+                  section: input.path,
+                  content: fullContent ?? `Old: ${input.oldContent?.substring(0, 100)}...\nNew: ${input.newContent?.substring(0, 100)}...`,
+                  stagingId: stagingIdMatch ? stagingIdMatch[1] : '',
+                })
+              }
+
+              // Generic handler for tools that stage one OR MORE files via the
+              // <staging_payload> tag (delete_jsx_element, remove_concept).
+              // Each file in payload.files becomes its own panel entry so the
+              // user sees every changed file.
+              if (
+                (toolUse.name === 'delete_jsx_element' || toolUse.name === 'remove_concept') &&
+                payload?.files &&
+                payload.files.length > 0
+              ) {
+                const input = toolUse.input as { description?: string; concept?: string; path?: string }
+                const baseDescription =
+                  toolUse.name === 'remove_concept'
+                    ? `Removed ${input.concept ? input.concept.replace(/_/g, ' ') : 'concept'}`
+                    : input.description || `Deleted element in ${input.path}`
+                for (const file of payload.files) {
+                  stagedChanges.push({
+                    id: `staged-${Date.now()}-${stagedChanges.length}`,
+                    type: 'website_update',
+                    title: toolUse.name === 'remove_concept' ? 'Concept Removal' : 'Element Deletion',
+                    description: `${baseDescription} — ${file.path}`,
+                    section: file.path,
+                    content: file.newContent,
+                    stagingId: '',
+                  })
+                }
+              }
+
+              toolResults.push({
+                name: toolUse.name,
+                input: toolUse.input,
+                result: result.substring(0, 5000),
+              })
+
+              toolResultsForMessage.push({
+                type: 'tool_result',
+                tool_use_id: toolUse.id,
+                content: result.substring(0, 10000),
+              })
+
+              send({ type: 'tool_end', name: toolUse.name, ok: true })
+            }
+
+            // Add assistant's response (with tool use) and tool results to messages
+            messages.push({
+              role: 'assistant',
+              content: response.content as ContentBlock[],
+            })
+
+            messages.push({
+              role: 'user',
+              content: toolResultsForMessage,
+            })
+          }
+
+          // Generate fallback response if empty but we have staged changes
+          if (!finalResponse && stagedChanges.length > 0) {
+            const changeDescriptions = stagedChanges.map(c => `- ${c.description}`).join('\n')
+            finalResponse = `I've staged the following changes for your approval:\n\n${changeDescriptions}\n\nClick **Preview** in the panel above to see them on a Vercel preview deployment, then **Publish to Live** when you're happy.`
+          }
+
+          // If we exhausted turns with no final text and nothing staged, surface
+          // what tools were attempted so the user can iterate instead of seeing
+          // an empty bubble.
+          if (!finalResponse && turn >= MAX_TURNS) {
+            const lastFew = toolResults.slice(-5).map(t => `- ${t.name}(${JSON.stringify(t.input).slice(0, 100)})`).join('\n')
+            finalResponse = `I ran out of steps before finishing this request (used all ${MAX_TURNS} of my action turns). Recent tool calls:\n\n${lastFew}\n\nThis usually happens when I keep searching for the same thing without finding it. Try asking again with the file path or a more specific search term.`
+          }
+
+          // Terminal event with the same payload shape the client used to
+          // get from the JSON response, plus an explicit success flag.
+          send({
+            type: 'final',
+            success: true,
+            response: finalResponse,
+            toolsUsed: toolResults.map(t => ({ name: t.name, input: t.input })),
+            turns: turn,
+            taskList,
+            stagedChanges: stagedChanges.length > 0 ? stagedChanges : null,
           })
-        }
-
-        // Check if this is a staged file write
-        if (toolUse.name === 'write_file' && result.includes('STAGED (NOT LIVE)')) {
-          const input = toolUse.input as { path?: string; description?: string; content?: string }
-          const stagingIdMatch = result.match(/\*?\*?Staging ID:\*?\*?\s*(file-\S+)/)
-
-          stagedChanges.push({
-            id: `staged-${Date.now()}-${stagedChanges.length}`,
-            type: 'website_update',
-            title: 'File Write',
-            description: input.description || `Create/update ${input.path}`,
-            section: input.path,
-            content: input.content,
-            stagingId: stagingIdMatch ? stagingIdMatch[1] : '',
+        } catch (error) {
+          console.error('Assistant API error:', error)
+          send({
+            type: 'error',
+            error: 'Failed to process request',
+            details: error instanceof Error ? error.message : 'Unknown error',
           })
+        } finally {
+          try { controller.close() } catch {}
         }
-
-        // Check if this is a staged file edit
-        if (toolUse.name === 'edit_file' && result.includes('STAGED (NOT LIVE)')) {
-          const input = toolUse.input as { path?: string; description?: string; oldContent?: string; newContent?: string }
-          const stagingIdMatch = result.match(/\*?\*?Staging ID:\*?\*?\s*(file-\S+)/)
-          // For edit_file the route needs the full new content for direct-publish.
-          // Pull it from the staging payload appended by the tool.
-          const fullContent = payload?.files?.[0]?.newContent
-
-          stagedChanges.push({
-            id: `staged-${Date.now()}-${stagedChanges.length}`,
-            type: 'website_update',
-            title: 'File Edit',
-            description: input.description || `Edit ${input.path}`,
-            section: input.path,
-            content: fullContent ?? `Old: ${input.oldContent?.substring(0, 100)}...\nNew: ${input.newContent?.substring(0, 100)}...`,
-            stagingId: stagingIdMatch ? stagingIdMatch[1] : '',
-          })
-        }
-
-        toolResults.push({
-          name: toolUse.name,
-          input: toolUse.input,
-          result: result.substring(0, 5000), // Limit result size
-        })
-
-        toolResultsForMessage.push({
-          type: 'tool_result',
-          tool_use_id: toolUse.id,
-          content: result.substring(0, 10000), // Limit for API
-        })
-      }
-
-      // Add assistant's response (with tool use) and tool results to messages
-      messages.push({
-        role: 'assistant',
-        content: response.content as ContentBlock[],
-      })
-
-      messages.push({
-        role: 'user',
-        content: toolResultsForMessage,
-      })
-    }
-
-    // Generate fallback response if empty but we have staged changes
-    if (!finalResponse && stagedChanges.length > 0) {
-      const changeDescriptions = stagedChanges.map(c => `- ${c.description}`).join('\n')
-      finalResponse = `I've staged the following changes for your approval:\n\n${changeDescriptions}\n\nPlease review the changes in the preview panel and click "Approve & Publish" when ready.`
-    }
-
-    // If we exhausted turns with no final text and nothing staged, surface
-    // what tools were attempted so the user can iterate instead of seeing
-    // an empty bubble.
-    if (!finalResponse && turn >= MAX_TURNS) {
-      const lastFew = toolResults.slice(-5).map(t => `- ${t.name}(${JSON.stringify(t.input).slice(0, 100)})`).join('\n')
-      finalResponse = `I ran out of steps before finishing this request (used all ${MAX_TURNS} of my action turns). Recent tool calls:\n\n${lastFew}\n\nThis usually happens when I keep searching for the same thing without finding it. Try asking again with the file path or a more specific search term.`
-    }
-
-    // Build response
-    return NextResponse.json({
-      success: true,
-      response: finalResponse,
-      toolsUsed: toolResults.map(t => ({ name: t.name, input: t.input })),
-      turns: turn,
-      taskList: taskList,
-      stagedChanges: stagedChanges.length > 0 ? stagedChanges : null,
+      },
     })
 
+    return new Response(stream, {
+      headers: {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+        // Disable proxy buffering on Vercel/nginx so events flush immediately.
+        'X-Accel-Buffering': 'no',
+      },
+    })
   } catch (error) {
-    console.error('Assistant API error:', error)
+    console.error('Assistant API setup error:', error)
     return NextResponse.json(
       {
         error: 'Failed to process request',

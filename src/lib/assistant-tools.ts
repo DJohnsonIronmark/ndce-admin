@@ -17,6 +17,673 @@ function getStagedFileContent(path: string): string | null {
   return null
 }
 
+// Build a Headers object that carries the X-Service-Token so internal
+// /api/website/* calls authenticate themselves to the new auth guard.
+// The token is set in Vercel as WEBSITE_SERVICE_TOKEN. If the env var
+// isn't configured the header is simply omitted — useful for local dev
+// where the routes aren't gated.
+function buildServiceHeaders(extra?: HeadersInit): Headers {
+  const headers = new Headers(extra)
+  const token = process.env.WEBSITE_SERVICE_TOKEN
+  if (token) headers.set('X-Service-Token', token)
+  return headers
+}
+
+// ============================================================================
+// find_visible_concept — deterministic discovery for "remove X" / "update X"
+//
+// The model is unreliable at remembering to check every page when a user says
+// something like "remove the call button". This tool runs a fixed set of
+// searches per concept, aggregates the hits, and returns them grouped by the
+// kind of artifact (visible JSX vs. SEO/schema vs. data source). The system
+// prompt forces the bot to call this BEFORE editing for any request that
+// targets a known concept, so the edit-set is computed by code rather than by
+// LLM reasoning.
+// ============================================================================
+
+type HitKind =
+  | 'visible_link'   // <a href="tel:"> etc — what the user sees and clicks
+  | 'visible_text'   // hardcoded user-facing strings
+  | 'data_source'    // studioInfo.X reference — flows everywhere
+  | 'schema_data'    // JSON-LD / metadata — invisible but tells search engines
+
+interface ConceptSearch {
+  pattern: string
+  kind: HitKind
+  why: string
+}
+
+interface DataDefinition {
+  file: string                // data file path, e.g. 'src/lib/data/studio.ts'
+  key: string                 // top-level key to clear, e.g. 'phone'
+}
+
+interface ConceptDef {
+  display: string             // human-readable name shown to user
+  aliases: string[]           // alternate keys the bot might pass
+  searches: ConceptSearch[]
+  // When the user says "remove this concept entirely," ALSO clear these
+  // values in their data-file source of truth. Without this, JSX deletions
+  // succeed but the underlying `phone: "(813)..."` stays in studio.ts as
+  // dead data. Only used by remove_concept, not find_visible_concept.
+  dataDefinitions?: DataDefinition[]
+}
+
+// Each concept lists the literal substrings to grep for and what each match
+// represents. Patterns are intentionally narrow (URL prefixes, exact field
+// names, hardcoded literals) so we minimize false positives — the bot has to
+// trust this list completely.
+const CONCEPTS: Record<string, ConceptDef> = {
+  call_button: {
+    display: 'click-to-call button / phone number',
+    aliases: ['phone_number', 'phone', 'call_link', 'click_to_call', 'tel'],
+    searches: [
+      { pattern: 'tel:', kind: 'visible_link', why: 'Renders a click-to-call link in the page' },
+      { pattern: '<PhoneIcon', kind: 'visible_link', why: 'Phone icon that visually identifies a phone block' },
+      { pattern: 'studioInfo.phone', kind: 'data_source', why: 'References the studio phone number' },
+      { pattern: 'telephone:', kind: 'schema_data', why: 'Schema field that tells Google the phone number' },
+    ],
+    dataDefinitions: [
+      { file: 'src/lib/data/studio.ts', key: 'phone' },
+    ],
+  },
+  email: {
+    display: 'studio email link',
+    aliases: ['email_link', 'mailto', 'contact_email'],
+    searches: [
+      { pattern: 'mailto:', kind: 'visible_link', why: 'Renders a clickable email link' },
+      { pattern: 'studioInfo.email', kind: 'data_source', why: 'References the studio email' },
+      { pattern: 'nicolesdancecenter@gmail.com', kind: 'visible_text', why: 'Hardcoded email text on the page' },
+      { pattern: 'email:', kind: 'schema_data', why: 'Schema field that tells Google the email' },
+    ],
+  },
+  address: {
+    display: 'studio address',
+    aliases: ['location', 'street_address'],
+    searches: [
+      { pattern: 'studioInfo.address', kind: 'data_source', why: 'References the studio address' },
+      { pattern: '17743 Hunting Bow', kind: 'visible_text', why: 'Hardcoded street address text' },
+      { pattern: 'streetAddress', kind: 'schema_data', why: 'Schema street field that Google reads' },
+      { pattern: 'addressLocality', kind: 'schema_data', why: 'Schema city field that Google reads' },
+    ],
+  },
+  hours: {
+    display: 'studio operating hours',
+    aliases: ['operating_hours', 'studio_hours', 'opening_hours'],
+    searches: [
+      { pattern: 'studioInfo.hours', kind: 'data_source', why: 'References hours from the studio data' },
+      { pattern: 'openingHours', kind: 'schema_data', why: 'Schema field that tells Google when the studio is open' },
+    ],
+  },
+  studio_name: {
+    display: 'studio name',
+    aliases: ['business_name', 'name'],
+    searches: [
+      { pattern: 'studioInfo.name', kind: 'data_source', why: 'References the studio name' },
+      { pattern: "Nicole's Dance Center Elite", kind: 'visible_text', why: 'Hardcoded full studio name' },
+      { pattern: 'NDCE', kind: 'visible_text', why: 'Studio short name' },
+    ],
+  },
+  logo: {
+    display: 'studio logo',
+    aliases: ['brand_logo', 'site_logo'],
+    searches: [
+      { pattern: 'nicoles-dance-elite-logo', kind: 'visible_link', why: 'Logo image file reference' },
+      { pattern: 'favicon', kind: 'schema_data', why: 'Browser tab icon' },
+      { pattern: 'og:image', kind: 'schema_data', why: 'Image shown when the site is shared on social media' },
+    ],
+  },
+}
+
+// Find the JSX element (opening tag through closing tag) that contains
+// `hitLine` (1-indexed). We try each common element type in order; the
+// first one whose tags actually balance around the hit line wins.
+//
+// This is intentionally heuristic, not a full JSX parser. It handles
+// the cases the bot keeps stumbling on (deleting <a>/<button>/<Link>/<p>
+// elements that wrap call buttons, phone text, etc.) where a real
+// parser would be overkill.
+function findEnclosingJsxRange(
+  content: string,
+  hitLine: number,
+): { startLine: number; endLine: number; tag: string } | null {
+  const lines = content.split('\n')
+  for (const tag of ['a', 'button', 'Link', 'div', 'p', 'span']) {
+    const range = findRangeForTag(lines, hitLine - 1, tag)
+    if (range) return { ...range, tag }
+  }
+  return null
+}
+
+function findRangeForTag(
+  lines: string[],
+  hitLine0: number,
+  tag: string,
+): { startLine: number; endLine: number } | null {
+  // Match `<tag ` or `<tag>` (NOT `<tagx`). Self-closing `<tag />` is
+  // intentionally counted as both open and close — for our use case
+  // self-closing wrappers don't enclose anything anyway.
+  const openRe = new RegExp(`<${tag}(\\s|>)`, 'g')
+  const selfCloseRe = new RegExp(`<${tag}[^>]*\\/>`, 'g')
+  const closeRe = new RegExp(`</${tag}>`, 'g')
+
+  // Walk forward from start of file, maintaining a stack of unmatched
+  // opens. The top of stack at hitLine0 is the enclosing element.
+  const stack: number[] = []
+  for (let i = 0; i <= hitLine0; i++) {
+    const line = lines[i]
+    const opens = (line.match(openRe) || []).length
+    const selfCloses = (line.match(selfCloseRe) || []).length
+    const closes = (line.match(closeRe) || []).length
+    // self-closes already counted as opens by openRe; subtract them.
+    const realOpens = opens - selfCloses
+    for (let o = 0; o < realOpens; o++) stack.push(i)
+    for (let c = 0; c < closes; c++) stack.pop()
+  }
+  if (stack.length === 0) return null
+
+  const startLine0 = stack[stack.length - 1]
+  // Walk forward from after hitLine to find the matching close.
+  let depth = stack.length
+  for (let i = hitLine0 + 1; i < lines.length; i++) {
+    const line = lines[i]
+    const opens = (line.match(openRe) || []).length
+    const selfCloses = (line.match(selfCloseRe) || []).length
+    const closes = (line.match(closeRe) || []).length
+    depth += (opens - selfCloses) - closes
+    if (depth < stack.length) {
+      return { startLine: startLine0 + 1, endLine: i + 1 }
+    }
+  }
+  return null
+}
+
+// Refuse edit_file calls that look like attempts to micro-edit a JSX element
+// instead of deleting it cleanly with delete_jsx_element. The bot has
+// repeatedly produced "hollow wrapper" diffs (icon-only delete, inner-text
+// delete, href neutered to "#") that leave a still-rendering button.
+//
+// Returns a refusal string to send back as the tool result, or null if the
+// edit should proceed.
+export function detectHollowJsxEdit(
+  path: string,
+  oldContent: string,
+  newContent: string,
+): string | null {
+  // We only police .tsx / .jsx files. Schema-data and config files (.ts, .js,
+  // .json) often legitimately contain `tel:` or `phone` strings that should
+  // be edited rather than deleted as JSX elements.
+  if (!path.endsWith('.tsx') && !path.endsWith('.jsx')) return null
+
+  const oldHasTel = /\btel:/.test(oldContent)
+  const oldHasMailto = /\bmailto:/.test(oldContent)
+  const oldHasPhoneIcon = /<PhoneIcon\b/.test(oldContent)
+  const oldHasJsxOpen = /<[A-Za-z][^>]*>/.test(oldContent)
+  const newIsEmpty = newContent.trim() === ''
+  const newHasMatchingClose = /<\/[A-Za-z]/.test(newContent)
+  const oldHasMatchingClose = /<\/[A-Za-z]/.test(oldContent)
+
+  // Pattern 1: oldContent contains a tel:/mailto: link or PhoneIcon, but
+  // newContent is non-empty AND doesn't contain the same tokens —
+  // the model is keeping the wrapper and trimming the contents.
+  if (
+    (oldHasTel || oldHasMailto || oldHasPhoneIcon) &&
+    !newIsEmpty &&
+    !/\btel:|\bmailto:|<PhoneIcon\b/.test(newContent)
+  ) {
+    return [
+      `❌ edit_file refused on ${path}.`,
+      ``,
+      `This looks like a partial deletion of a JSX element: oldContent contains`,
+      `\`tel:\`, \`mailto:\`, or \`<PhoneIcon>\`, and newContent strips it but`,
+      `keeps surrounding JSX. That leaves a hollow wrapper still rendering as a`,
+      `button on the page — exactly the bug we keep seeing.`,
+      ``,
+      `Use \`delete_jsx_element\` instead. Pick a unique substring inside the`,
+      `element (the full \`tel:\${...}\` template, a unique className, or a`,
+      `unique inner text), and the tool will delete the whole element from`,
+      `opening tag through closing tag.`,
+      ``,
+      `Example:`,
+      `delete_jsx_element({`,
+      `  path: "${path}",`,
+      `  locator: "tel:\${studioInfo.phone",`,
+      `  description: "remove call button"`,
+      `})`,
+    ].join('\n')
+  }
+
+  // Pattern 2: oldContent has a JSX opening tag with a matching close, and
+  // newContent has no closing tag — likely a broken-JSX edit (e.g.
+  // `defaultValue={...}` → `defaultValue=`).
+  if (oldHasJsxOpen && oldHasMatchingClose && !newIsEmpty && !newHasMatchingClose) {
+    // Heuristic check: did the model leave a dangling attribute (`attr=` with
+    // no value) or unmatched braces?
+    const dangling = /=\s*$/m.test(newContent) || /\{[^}]*$/.test(newContent)
+    if (dangling) {
+      return [
+        `❌ edit_file refused on ${path}.`,
+        ``,
+        `newContent looks like broken JSX — there's a dangling attribute`,
+        `assignment or unmatched brace. This produces invalid syntax and`,
+        `breaks the build.`,
+        ``,
+        `If you're trying to delete an element, use \`delete_jsx_element\`.`,
+        `If you're trying to remove a single attribute, edit the entire`,
+        `opening tag — don't leave \`attr=\` with no value.`,
+      ].join('\n')
+    }
+  }
+
+  // Pattern 3: oldContent is a tight slice of a `Call ${...}` template literal
+  // that the model is trying to neuter. Easy tell: oldContent contains the
+  // word "Call" inside a template literal context but doesn't include the
+  // surrounding JSX element.
+  const oldHasCallText = /\bCall\s+\{|\bCall\s+\$\{/.test(oldContent)
+  if (oldHasCallText && !oldHasMatchingClose && !newIsEmpty) {
+    return [
+      `❌ edit_file refused on ${path}.`,
+      ``,
+      `This edit only modifies the inner text "Call {phone}" but leaves the`,
+      `wrapping JSX element intact — the result still renders a button.`,
+      ``,
+      `Use \`delete_jsx_element\` with a locator inside the call button (e.g.`,
+      `the \`tel:\` template literal or the element's className) to delete the`,
+      `whole element at once.`,
+    ].join('\n')
+  }
+
+  return null
+}
+
+function resolveConcept(input: string): { key: string; def: ConceptDef } | null {
+  const norm = input.toLowerCase().replace(/[\s\-]+/g, '_')
+  if (CONCEPTS[norm]) return { key: norm, def: CONCEPTS[norm] }
+  for (const [key, def] of Object.entries(CONCEPTS)) {
+    if (def.aliases.includes(norm)) return { key, def }
+  }
+  return null
+}
+
+interface AggregatedHit {
+  file: string
+  line: number
+  snippet: string
+  kind: HitKind
+  why: string
+}
+
+async function findVisibleConcept(input: string): Promise<string> {
+  const resolved = resolveConcept(input)
+  if (!resolved) {
+    const known = Object.keys(CONCEPTS).join(', ')
+    return `Unknown concept "${input}". Known concepts: ${known}.\n\nIf the user is asking about something not in this list, fall back to search_source_code with a specific literal string they mentioned. Do NOT free-associate — search only for things you can verify exist.`
+  }
+
+  const { def } = resolved
+
+  // Run all searches against main in parallel for speed.
+  const mainSearchResults = await Promise.all(
+    def.searches.map(async (s) => {
+      try {
+        const matches = await searchInFiles(s.pattern, false)
+        return matches.map((m) => ({
+          file: m.path,
+          line: m.line,
+          snippet: m.content.trim().substring(0, 140),
+          kind: s.kind,
+          why: s.why,
+        } as AggregatedHit))
+      } catch {
+        return []
+      }
+    }),
+  )
+
+  // Also search the staged copies the bot has produced so far in this
+  // session. If the bot already deleted a reference via edit_file, the
+  // hit on main is no longer accurate — we want the post-edit view so
+  // the bot can verify its own work, not a stale snapshot.
+  const stagedFiles = new Map<string, string>()
+  for (const change of getAllGenericPendingChanges()) {
+    if (change.path && change.content) stagedFiles.set(change.path, change.content)
+  }
+
+  const stagedSearchHits: AggregatedHit[] = []
+  for (const [path, content] of stagedFiles) {
+    const lines = content.split('\n')
+    for (const s of def.searches) {
+      const needle = s.pattern.toLowerCase()
+      lines.forEach((line, idx) => {
+        if (line.toLowerCase().includes(needle)) {
+          stagedSearchHits.push({
+            file: path,
+            line: idx + 1,
+            snippet: line.trim().substring(0, 140),
+            kind: s.kind,
+            why: s.why + ' (in staged content)',
+          })
+        }
+      })
+    }
+  }
+
+  // Merge: for any file that has staged content, drop the main hits for
+  // that file and use the staged hits. Files without staged edits keep
+  // their main hits.
+  const merged: AggregatedHit[] = []
+  for (const group of mainSearchResults) {
+    for (const hit of group) {
+      if (stagedFiles.has(hit.file)) continue
+      merged.push(hit)
+    }
+  }
+  merged.push(...stagedSearchHits)
+
+  // Dedupe (file:line keys), skip backup folders.
+  const seen = new Set<string>()
+  const hits: AggregatedHit[] = []
+  for (const hit of merged) {
+    if (hit.file.startsWith('backups/')) continue
+    const key = `${hit.file}:${hit.line}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    hits.push(hit)
+  }
+
+  if (hits.length === 0) {
+    if (stagedFiles.size > 0) {
+      return `✅ All references for "${def.display}" have been removed in your staged edits. You're ready to finish — respond to the user with a summary of what changed and tell them to click Preview.`
+    }
+    return `No references found for "${def.display}". Either the concept is already removed or the user is describing something else. Ask them to clarify with a screenshot or specific page name.`
+  }
+
+  // Group by kind so the bot sees the structure (visible vs data vs schema).
+  const byKind: Record<HitKind, AggregatedHit[]> = {
+    visible_link: [],
+    visible_text: [],
+    data_source: [],
+    schema_data: [],
+  }
+  for (const h of hits) byKind[h.kind].push(h)
+
+  const sections: string[] = []
+  const order: Array<[HitKind, string]> = [
+    ['visible_link', 'VISIBLE links / buttons (these are what the user sees)'],
+    ['visible_text', 'VISIBLE hardcoded text'],
+    ['data_source', 'DATA SOURCE (changing this propagates everywhere)'],
+    ['schema_data', 'SEARCH-ENGINE DATA (invisible but tells Google)'],
+  ]
+  for (const [kind, label] of order) {
+    if (byKind[kind].length === 0) continue
+    sections.push(`### ${label}`)
+    for (const h of byKind[kind]) {
+      sections.push(`- **${h.file}:${h.line}** — ${h.why}\n  \`${h.snippet}\``)
+    }
+  }
+
+  const fileCount = new Set(hits.map((h) => h.file)).size
+
+  return [
+    `## Discovery: ${def.display}`,
+    ``,
+    `Found **${hits.length} reference(s) across ${fileCount} file(s)** that you must edit to fully complete this request.`,
+    ``,
+    sections.join('\n'),
+    ``,
+    `---`,
+    `### What you MUST do next`,
+    ``,
+    `1. Read each file in the list above (use read_file)`,
+    `2. Stage an edit_file for each one — the user will see one combined preview`,
+    `3. DO NOT respond to the user with "I've staged the change" until every entry above has a corresponding edit_file or apply_find_replace call.`,
+    `4. If a file appears here that you don't intend to touch, you MUST explain why in your final reply.`,
+    ``,
+    `Half-finished edit-sets are worse than nothing — Nicole will see a half-broken site (e.g. one call button removed, four still live). Be exhaustive.`,
+  ].join('\n')
+}
+
+// ============================================================================
+// remove_concept — deterministic deletion across the entire codebase.
+//
+// The model has been unreliable at picking edit boundaries. This tool takes
+// the LLM out of the deletion step entirely: given a concept name, it walks
+// the same registry, finds every hit across visible JSX / schema / data, and
+// applies the appropriate deletion strategy per kind:
+//   - visible_link / visible_text → delete enclosing JSX element
+//   - schema_data → strip the matched line
+//   - data_source DEFINITIONS (in dataDefinitions[]) → clear the value
+//   - data_source REFERENCES → ignored here (handled by JSX deletion above)
+//
+// Returns a single summary; stages all edits in one batch.
+// ============================================================================
+
+interface RemoveConceptFileResult {
+  path: string
+  sha: string
+  finalContent: string
+  jsxRangesDeleted: Array<{ startLine: number; endLine: number; tag: string }>
+  schemaLinesStripped: number[]
+  dataFieldsCleared: string[]
+}
+
+async function removeConcept(input: string, baseUrl: string, requestNote?: string): Promise<string> {
+  const resolved = resolveConcept(input)
+  if (!resolved) {
+    const known = Object.keys(CONCEPTS).join(', ')
+    return `Unknown concept "${input}" for remove_concept. Known concepts: ${known}.`
+  }
+  const { def } = resolved
+
+  // Step 1: discover every hit. We search main, then overlay any session-staged
+  // versions of files so multiple remove_concept calls in one session compose.
+  type FileEntry = { content: string; sha: string }
+  const fileEntries = new Map<string, FileEntry>()
+
+  const loadFile = async (path: string): Promise<FileEntry | null> => {
+    if (fileEntries.has(path)) return fileEntries.get(path)!
+    const staged = getStagedFileContent(path)
+    if (staged !== null) {
+      let sha = ''
+      try { sha = (await getFileContent(path)).sha } catch {}
+      const entry = { content: staged, sha }
+      fileEntries.set(path, entry)
+      return entry
+    }
+    try {
+      const fresh = await getFileContent(path)
+      const entry = { content: fresh.content, sha: fresh.sha }
+      fileEntries.set(path, entry)
+      return entry
+    } catch {
+      return null
+    }
+  }
+
+  // Track which (pattern, kind) tuples to apply per file
+  const targetsByFile = new Map<string, Array<ConceptSearch>>()
+
+  await Promise.all(def.searches.map(async (s) => {
+    try {
+      const matches = await searchInFiles(s.pattern, false)
+      for (const m of matches) {
+        if (m.path.startsWith('backups/')) continue
+        const entry = await loadFile(m.path)
+        if (!entry) continue
+        const arr = targetsByFile.get(m.path) || []
+        if (!arr.some(x => x.pattern === s.pattern && x.kind === s.kind)) arr.push(s)
+        targetsByFile.set(m.path, arr)
+      }
+    } catch {
+      // skip — search failure on one pattern shouldn't kill the whole op
+    }
+  }))
+
+  // Also include data definition files even if they didn't show up in searches
+  // (they may not match any pattern but still need their value cleared).
+  if (def.dataDefinitions) {
+    for (const dd of def.dataDefinitions) {
+      await loadFile(dd.file)
+    }
+  }
+
+  // Step 2: apply deletions per file. Operations are computed in two passes so
+  // that JSX-element deletions don't shift line numbers under schema-line
+  // strips. We collect line indices to remove, then splice in reverse order.
+  const fileResults: RemoveConceptFileResult[] = []
+
+  for (const [path, entry] of fileEntries) {
+    const targets = targetsByFile.get(path) || []
+    const fileLines = entry.content.split('\n')
+
+    const linesToDelete = new Set<number>()         // 0-indexed
+    const jsxDeleted: Array<{ startLine: number; endLine: number; tag: string }> = []
+    const schemaStripped: number[] = []
+    const dataFieldsCleared: string[] = []
+
+    // For each target pattern, find every matching line in the CURRENT lines
+    // and queue a deletion of the appropriate scope.
+    for (const t of targets) {
+      const idxs: number[] = []
+      for (let i = 0; i < fileLines.length; i++) {
+        if (fileLines[i].includes(t.pattern)) idxs.push(i)
+      }
+      for (const idx of idxs) {
+        if (linesToDelete.has(idx)) continue // already queued
+        if (t.kind === 'visible_link' || t.kind === 'visible_text') {
+          const range = findEnclosingJsxRange(fileLines.join('\n'), idx + 1)
+          if (range) {
+            for (let i = range.startLine - 1; i <= range.endLine - 1; i++) linesToDelete.add(i)
+            jsxDeleted.push({ ...range })
+          } else {
+            linesToDelete.add(idx)
+          }
+        } else if (t.kind === 'schema_data') {
+          linesToDelete.add(idx)
+          schemaStripped.push(idx + 1)
+        }
+        // data_source references are intentionally NOT auto-deleted here.
+        // They live inside JSX that's already being deleted (call buttons),
+        // or inside data files which are handled separately below.
+      }
+    }
+
+    // Data-definition handling: for each (file, key) in dataDefinitions whose
+    // file matches THIS path, find the line `<key>: "<value>"` (or single-quote)
+    // and clear the value. If we can't find a clean match, skip — better to
+    // leave dead data than to corrupt the file.
+    if (def.dataDefinitions) {
+      for (const dd of def.dataDefinitions) {
+        if (dd.file !== path) continue
+        for (let i = 0; i < fileLines.length; i++) {
+          if (linesToDelete.has(i)) continue
+          const m = fileLines[i].match(
+            new RegExp(`^(\\s*)(${dd.key})(\\s*:\\s*)(['\"])([^'\"]*)\\4(\\s*,?\\s*)$`)
+          )
+          if (m) {
+            fileLines[i] = `${m[1]}${m[2]}${m[3]}${m[4]}${m[4]}${m[6]}`
+            dataFieldsCleared.push(dd.key)
+            break
+          }
+        }
+      }
+    }
+
+    if (linesToDelete.size === 0 && dataFieldsCleared.length === 0) {
+      continue
+    }
+
+    // Apply line deletions highest-first to keep indices stable
+    if (linesToDelete.size > 0) {
+      const sorted = [...linesToDelete].sort((a, b) => b - a)
+      for (const idx of sorted) fileLines.splice(idx, 1)
+    }
+
+    fileResults.push({
+      path,
+      sha: entry.sha,
+      finalContent: fileLines.join('\n'),
+      jsxRangesDeleted: jsxDeleted,
+      schemaLinesStripped: schemaStripped,
+      dataFieldsCleared,
+    })
+  }
+
+  if (fileResults.length === 0) {
+    return `No matching code found for "${def.display}". Either the concept is already removed or the user is describing something else.`
+  }
+
+  // Step 3: stage every changed file via /api/website/file-operation, and
+  // build a single staging_payload so the publish path can commit directly.
+  const stagingPayload: Array<{ path: string; newContent: string; sha: string }> = []
+  const stagingErrors: string[] = []
+
+  for (const fr of fileResults) {
+    try {
+      const response = await fetch(`${baseUrl}/api/website/file-operation`, {
+        method: 'POST',
+        headers: buildServiceHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          operation: 'edit',
+          path: fr.path,
+          content: fr.finalContent,
+          sha: fr.sha,
+          description: `remove_concept: ${def.display}${requestNote ? ` (${requestNote})` : ''}`,
+        }),
+      })
+      const data = await response.json()
+      if (!data.success) {
+        stagingErrors.push(`${fr.path}: ${data.message || 'unknown error'}`)
+        continue
+      }
+      stagingPayload.push({ path: fr.path, newContent: fr.finalContent, sha: fr.sha })
+    } catch (err) {
+      stagingErrors.push(`${fr.path}: ${err instanceof Error ? err.message : 'fetch failed'}`)
+    }
+  }
+
+  // Step 4: build human-readable summary
+  const totalJsxDeleted = fileResults.reduce((n, fr) => n + fr.jsxRangesDeleted.length, 0)
+  const totalSchemaStripped = fileResults.reduce((n, fr) => n + fr.schemaLinesStripped.length, 0)
+  const totalDataCleared = fileResults.reduce((n, fr) => n + fr.dataFieldsCleared.length, 0)
+
+  const lines: string[] = [
+    `✅ **Removed ${def.display}** — STAGED (NOT LIVE)`,
+    ``,
+    `**Summary:**`,
+    `- Deleted ${totalJsxDeleted} JSX element(s) from ${fileResults.filter(fr => fr.jsxRangesDeleted.length > 0).length} file(s)`,
+    `- Stripped ${totalSchemaStripped} schema line(s)`,
+    `- Cleared ${totalDataCleared} data field(s)`,
+    `- Files modified: ${stagingPayload.length}`,
+    ``,
+    `**Per-file:**`,
+  ]
+  for (const fr of fileResults) {
+    const bits: string[] = []
+    if (fr.jsxRangesDeleted.length > 0) {
+      bits.push(`deleted ${fr.jsxRangesDeleted.length} <${fr.jsxRangesDeleted.map(r => r.tag).join('>/<')}> element(s)`)
+    }
+    if (fr.schemaLinesStripped.length > 0) {
+      bits.push(`stripped ${fr.schemaLinesStripped.length} schema line(s)`)
+    }
+    if (fr.dataFieldsCleared.length > 0) {
+      bits.push(`cleared ${fr.dataFieldsCleared.join(', ')}`)
+    }
+    lines.push(`- **${fr.path}** — ${bits.join('; ')}`)
+  }
+  if (stagingErrors.length > 0) {
+    lines.push(``, `⚠️ Errors:`)
+    for (const e of stagingErrors) lines.push(`- ${e}`)
+  }
+  lines.push(
+    ``,
+    `📋 Tell the user: "I removed every reference to the ${def.display}. Click Preview to see the staging deployment, then Publish to Live."`,
+  )
+
+  const summary = lines.join('\n')
+  return `${summary}\n\n<staging_payload>${JSON.stringify({ files: stagingPayload })}</staging_payload>`
+}
+
 export const ASSISTANT_TOOLS: Anthropic.Tool[] = [
   {
     name: 'review_website',
@@ -89,6 +756,60 @@ export const ASSISTANT_TOOLS: Anthropic.Tool[] = [
         },
       },
       required: ['searchText'],
+    },
+  },
+  {
+    name: 'delete_jsx_element',
+    description: 'PREFERRED tool for "remove this clickable element" requests (call buttons, links, etc.). Finds the enclosing JSX element around a unique locator string and DELETES the entire element from opening tag through closing tag in one shot. Use this instead of edit_file whenever the user asks to delete a button/link/element — edit_file lets you make subtle micro-edits that leave a hollow wrapper rendering an empty button. This tool does not give you that option; it deletes the whole thing or fails clean.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        path: {
+          type: 'string',
+          description: 'File path relative to the repo root, e.g. "src/app/page.tsx".',
+        },
+        locator: {
+          type: 'string',
+          description: 'A unique substring that appears INSIDE the element you want to delete. Good locators: a tel: href, a specific className combination, a unique inner text. Must be unique enough to match exactly one element.',
+        },
+        description: {
+          type: 'string',
+          description: 'A short human-readable note about what is being deleted, e.g. "homepage CTA call button".',
+        },
+      },
+      required: ['path', 'locator', 'description'],
+    },
+  },
+  {
+    name: 'remove_concept',
+    description: 'PREFERRED tool for "remove X" / "delete X" / "we no longer have X" requests where X is a known concept (call_button, email, address, hours, studio_name, logo). Does the entire deletion deterministically with NO LLM choices: walks every visible JSX hit and deletes the wrapping element, strips matching schema lines, and clears matching values in data files. ONE tool call replaces 5+ edit_file calls and eliminates the hollow-wrapper bug class. Use this FIRST for any removal request — only fall back to delete_jsx_element / edit_file if the concept isn\'t in the supported list.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        concept: {
+          type: 'string',
+          description: 'A canonical concept name. Supported: call_button, phone_number, email, address, hours, studio_name, logo. Synonyms accepted: phone, click_to_call, mailto, location, operating_hours, business_name, brand_logo.',
+        },
+        request_note: {
+          type: 'string',
+          description: 'Optional short note about why the user is removing this — gets baked into the commit message. e.g. "studio no longer has a phone line".',
+        },
+      },
+      required: ['concept'],
+    },
+  },
+  {
+    name: 'find_visible_concept',
+    description: 'Use this when the user wants to UPDATE a concept (not remove it) — returns the COMPLETE list of code locations you must edit. For REMOVE requests, prefer remove_concept which does the work in one shot. Supported concepts: call_button, email, address, hours, studio_name, logo.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        concept: {
+          type: 'string',
+          description: 'A canonical concept name. Supported: call_button, phone_number, email, address, hours, studio_name, logo. (Synonyms like "phone", "click_to_call", "mailto", "location", "operating_hours", "business_name", "brand_logo" are also accepted.)',
+        },
+      },
+      required: ['concept'],
     },
   },
   {
@@ -250,7 +971,7 @@ export async function executeTool(
       case 'review_website': {
         const response = await fetch(`${baseUrl}/api/website/verify`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: buildServiceHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({ mode: 'review' }),
         })
         const data = await response.json()
@@ -289,7 +1010,7 @@ export async function executeTool(
         const { searchText } = toolInput as { searchText: string }
         const response = await fetch(`${baseUrl}/api/website/verify`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: buildServiceHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({ searchText, mode: 'search' }),
         })
         const data = await response.json()
@@ -304,7 +1025,7 @@ export async function executeTool(
         const { findText, replaceText } = toolInput as { findText: string; replaceText: string }
         const response = await fetch(`${baseUrl}/api/website/find-replace`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: buildServiceHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({ find: findText, replace: replaceText, preview: true }),
         })
         const data = await response.json()
@@ -328,7 +1049,7 @@ export async function executeTool(
         const { findText, replaceText } = toolInput as { findText: string; replaceText: string }
         const response = await fetch(`${baseUrl}/api/website/find-replace`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: buildServiceHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({ find: findText, replace: replaceText, preview: false }),
         })
         const data = await response.json()
@@ -338,7 +1059,7 @@ export async function executeTool(
         if (data.matchCount === 0) {
           return `No matches found for "${findText}". No changes were made.`
         }
-        const summary = `✅ **Find & Replace - STAGED (NOT LIVE)**\n\nReplaced ${data.matchCount} occurrence(s) in ${data.filesAffected} file(s).\n\n**Staging ID:** ${data.stagingId || 'N/A'}\n\n⚠️ **IMPORTANT:** These changes are in the staging area only. They will NOT appear on the website until the user clicks "Approve & Publish" in the right panel.\n\n📋 Tell the user: "I've staged these changes. Please click 'Approve & Publish' to make them live."`
+        const summary = `✅ **Find & Replace - STAGED (NOT LIVE)**\n\nReplaced ${data.matchCount} occurrence(s) in ${data.filesAffected} file(s).\n\n**Staging ID:** ${data.stagingId || 'N/A'}\n\n⚠️ **IMPORTANT:** These changes are in the staging area only. They will NOT appear on the website until the user clicks Preview, reviews the staging deployment, then clicks Publish to Live.\n\n📋 Tell the user: "I've staged these changes. Please click Preview to build a staging deployment, then Publish to Live to push it."`
         // Embed prepared file contents so the route can pass them directly to publish,
         // bypassing the in-memory staging store that doesn't survive serverless cold starts.
         if (Array.isArray(data.files) && data.files.length > 0) {
@@ -349,7 +1070,9 @@ export async function executeTool(
 
       case 'search_source_code': {
         const { searchText } = toolInput as { searchText: string }
-        const response = await fetch(`${baseUrl}/api/website/find-replace?q=${encodeURIComponent(searchText)}`)
+        const response = await fetch(`${baseUrl}/api/website/find-replace?q=${encodeURIComponent(searchText)}`, {
+          headers: buildServiceHeaders(),
+        })
         const data = await response.json()
         if (!data.success || data.matchCount === 0) {
           return `No matches found for "${searchText}" in the source code.`
@@ -362,8 +1085,125 @@ export async function executeTool(
         return result
       }
 
+      case 'find_visible_concept': {
+        const { concept } = toolInput as { concept: string }
+        if (!concept) {
+          return `Error: "concept" parameter is required. Supported concepts: ${Object.keys(CONCEPTS).join(', ')}.`
+        }
+        return await findVisibleConcept(concept)
+      }
+
+      case 'remove_concept': {
+        if (!isGitHubAvailable()) {
+          return 'Error: GitHub integration is not configured.'
+        }
+        const { concept, request_note } = toolInput as { concept: string; request_note?: string }
+        if (!concept) {
+          return `Error: "concept" parameter is required. Supported concepts: ${Object.keys(CONCEPTS).join(', ')}.`
+        }
+        return await removeConcept(concept, baseUrl, request_note)
+      }
+
+      case 'delete_jsx_element': {
+        if (!isGitHubAvailable()) {
+          return 'Error: GitHub integration is not configured.'
+        }
+        const { path, locator, description } = toolInput as {
+          path: string
+          locator: string
+          description: string
+        }
+        if (!path || !locator) {
+          return 'Error: both "path" and "locator" are required.'
+        }
+        try {
+          // Get latest content — staged version takes precedence so multiple
+          // delete calls on the same file compose correctly.
+          const stagedContent = getStagedFileContent(path)
+          let content: string
+          let sha: string
+          if (stagedContent !== null) {
+            content = stagedContent
+            try {
+              const fresh = await getFileContent(path)
+              sha = fresh.sha
+            } catch {
+              sha = ''
+            }
+          } else {
+            const fresh = await getFileContent(path)
+            content = fresh.content
+            sha = fresh.sha
+          }
+
+          // Find unique locator line.
+          const lines = content.split('\n')
+          const matches: number[] = []
+          for (let i = 0; i < lines.length; i++) {
+            if (lines[i].includes(locator)) matches.push(i)
+          }
+          if (matches.length === 0) {
+            return `Error: locator "${locator}" not found in ${path}. The file may already have been edited. Call read_file to see current content.`
+          }
+          if (matches.length > 1) {
+            return `Error: locator "${locator}" matched ${matches.length} lines in ${path}. The locator must be unique to one element. Lines: ${matches.map(m => m + 1).join(', ')}. Try a more specific substring (e.g. include surrounding className or attribute values).`
+          }
+          const hitLine = matches[0] + 1 // 1-indexed for findEnclosingJsxRange
+
+          const range = findEnclosingJsxRange(content, hitLine)
+          if (!range) {
+            return `Error: could not find an enclosing JSX element around "${locator}" in ${path}. The locator may not be inside an <a>/<button>/<Link>/<p>/<div>/<span>. Use edit_file with explicit oldContent instead.`
+          }
+
+          // Compute deleted span (for confirmation) and new content.
+          const deletedSnippet = lines.slice(range.startLine - 1, range.endLine).join('\n')
+          const before = lines.slice(0, range.startLine - 1)
+          const after = lines.slice(range.endLine)
+          const newContent = [...before, ...after].join('\n')
+
+          // Stage via /api/website/file-operation.
+          const response = await fetch(`${baseUrl}/api/website/file-operation`, {
+            method: 'POST',
+            headers: buildServiceHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify({
+              operation: 'edit',
+              path,
+              content: newContent,
+              sha,
+              description: description || `Delete <${range.tag}> element in ${path}`,
+            }),
+          })
+          const data = await response.json()
+          if (!data.success) {
+            return `Failed to stage delete: ${data.message || 'Unknown error'}`
+          }
+
+          const summary = [
+            `✅ Deleted <${range.tag}> element from ${path} (lines ${range.startLine}–${range.endLine}) - STAGED (NOT LIVE)`,
+            ``,
+            `**Deleted:**`,
+            '```jsx',
+            deletedSnippet,
+            '```',
+            ``,
+            `**Description:** ${description || '(none)'}`,
+            `**Staging ID:** ${data.stagingId || 'N/A'}`,
+            ``,
+            `⚠️ This change is in staging only. After staging all your deletes, call find_visible_concept to verify nothing was missed, then tell the user to click Preview.`,
+          ].join('\n')
+
+          // Embed staging payload so the route can publish directly without
+          // depending on the in-memory staging store across cold starts.
+          return `${summary}\n\n<staging_payload>${JSON.stringify({ files: [{ path, newContent, sha }] })}</staging_payload>`
+        } catch (error) {
+          return `Error deleting element from "${path}": ${error instanceof Error ? error.message : 'Unknown error'}`
+        }
+      }
+
       case 'get_staged_changes': {
-        const response = await fetch(`${baseUrl}/api/website/publish`)
+        const response = await fetch(`${baseUrl}/api/website/publish`, {
+          headers: buildServiceHeaders(),
+        })
         const data = await response.json()
         if (!data.hasChanges) {
           return 'No changes are currently staged for approval.'
@@ -490,7 +1330,7 @@ export async function executeTool(
           // Stage the write operation
           const response = await fetch(`${baseUrl}/api/website/file-operation`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: buildServiceHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({
               operation: 'write',
               path,
@@ -504,7 +1344,7 @@ export async function executeTool(
 
           if (data.success) {
             const action = sha ? 'updated' : 'created'
-            return `✅ **File ${action} - STAGED (NOT LIVE)**\n\n**Path:** ${path}\n**Description:** ${description}\n**Lines:** ${content.split('\n').length}\n**Staging ID:** ${data.stagingId || 'N/A'}\n\n⚠️ **IMPORTANT:** This change is in the staging area only. It will NOT appear on the website until the user clicks "Approve & Publish" in the right panel.\n\n📋 Tell the user: "I've staged these changes. Please click 'Approve & Publish' to make them live."`
+            return `✅ **File ${action} - STAGED (NOT LIVE)**\n\n**Path:** ${path}\n**Description:** ${description}\n**Lines:** ${content.split('\n').length}\n**Staging ID:** ${data.stagingId || 'N/A'}\n\n⚠️ **IMPORTANT:** This change is in the staging area only. It will NOT appear on the website until the user clicks Preview, reviews the staging deployment, then clicks Publish to Live.\n\n📋 Tell the user: "I've staged these changes. Please click Preview to build a staging deployment, then Publish to Live to push it."`
           } else {
             return `Failed to stage file write: ${data.message || 'Unknown error'}`
           }
@@ -523,6 +1363,16 @@ export async function executeTool(
           newContent: string
           description: string
         }
+
+        // Guard: refuse JSX-element micro-edits that leave a hollow wrapper.
+        // The model has repeatedly tried to "delete" a call button by stripping
+        // the icon, the inner text, or the href value — leaving the surrounding
+        // <a>/<button> still rendering as a button. Force it onto delete_jsx_element.
+        const refusal = detectHollowJsxEdit(path, oldContent, newContent)
+        if (refusal) {
+          return refusal
+        }
+
         try {
           // If a prior tool call already staged an edit to this file in the same
           // session, build on top of that staged content. Otherwise pull fresh
@@ -570,7 +1420,7 @@ export async function executeTool(
           // Stage the edit operation
           const response = await fetch(`${baseUrl}/api/website/file-operation`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: buildServiceHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({
               operation: 'edit',
               path,
@@ -585,7 +1435,7 @@ export async function executeTool(
           const data = await response.json()
 
           if (data.success) {
-            const summary = `✅ **File Edit - STAGED (NOT LIVE)**\n\n**Path:** ${path}\n**Description:** ${description}\n**Staging ID:** ${data.stagingId || 'N/A'}\n\n**Change Preview:**\n- Removed: \`${oldContent.substring(0, 100)}${oldContent.length > 100 ? '...' : ''}\`\n- Added: \`${newContent.substring(0, 100)}${newContent.length > 100 ? '...' : ''}\`\n\n⚠️ **IMPORTANT:** This change is in the staging area only. It will NOT appear on the website until the user clicks "Approve & Publish" in the right panel.\n\n📋 Tell the user: "I've staged these changes. Please click 'Approve & Publish' to make them live."`
+            const summary = `✅ **File Edit - STAGED (NOT LIVE)**\n\n**Path:** ${path}\n**Description:** ${description}\n**Staging ID:** ${data.stagingId || 'N/A'}\n\n**Change Preview:**\n- Removed: \`${oldContent.substring(0, 100)}${oldContent.length > 100 ? '...' : ''}\`\n- Added: \`${newContent.substring(0, 100)}${newContent.length > 100 ? '...' : ''}\`\n\n⚠️ **IMPORTANT:** This change is in the staging area only. It will NOT appear on the website until the user clicks Preview, reviews the staging deployment, then clicks Publish to Live.\n\n📋 Tell the user: "I've staged these changes. Please click Preview to build a staging deployment, then Publish to Live to push it."`
             // Pass the full updated content via staging payload so the publish call
             // can commit directly without depending on the in-memory store.
             return `${summary}\n\n<staging_payload>${JSON.stringify({ files: [{ path, newContent: updatedContent, sha: sha || '' }] })}</staging_payload>`
@@ -702,8 +1552,9 @@ When you use write_file, edit_file, or apply_find_replace:
 
 **YOU MUST ALWAYS SAY:**
 - ✅ "I've STAGED these changes for your review"
-- ✅ "Click 'Approve & Publish' in the panel on the right to make these live"
-- ✅ "The changes are ready for your approval but NOT yet on the website"
+- ✅ "Click **Preview** in the panel on the right — you'll get a live preview URL of the site WITH these changes applied"
+- ✅ "Once the preview looks right, click **Publish to Live** to push it to the production site"
+- ✅ "The changes are ready for your approval but NOT yet on the live site"
 
 This is extremely important - users get confused when told something is live but they can't see it.
 
@@ -729,6 +1580,274 @@ Concrete rules:
 - If you can't find what the user described after 2 searches, do not
   keep searching. Tell the user "I couldn't locate that — can you
   point me at the file or paste a screenshot?" and stop.
+
+## ⛔⛔ TOP RULE FOR "REMOVE X" REQUESTS — use remove_concept ⛔⛔
+
+When the user says "remove the call buttons," "we no longer have a phone,"
+"delete the email link," "take down the address," etc., and the thing
+they're removing matches a known concept (call_button, email, address,
+hours, studio_name, logo) — the FIRST and ONLY tool you should call is
+\`remove_concept\`.
+
+\`\`\`
+remove_concept({
+  concept: "call_button",
+  request_note: "studio no longer has a phone line"
+})
+\`\`\`
+
+That single call:
+- Searches the entire codebase for every variant (tel: links, schema fields, data file values)
+- Deletes the wrapping JSX element for visible buttons
+- Strips matching schema lines from JSON-LD
+- Clears the value in the data file (e.g. \`phone: ""\`)
+- Stages all the edits in one batch
+
+DO NOT manually call find_visible_concept + delete_jsx_element + edit_file
+for known concepts. \`remove_concept\` does the whole job in one shot with
+ZERO LLM judgment in the deletion step. You cannot leave a hollow wrapper
+or miss a file because the tool handles that for you.
+
+After remove_concept returns, your job is done. Tell the user what the
+summary said and direct them to click Preview. Do NOT make additional
+edits "just to be safe" — duplicating work will collide with what
+remove_concept already staged.
+
+Only fall through to find_visible_concept / delete_jsx_element / edit_file
+if the user is asking about something OUTSIDE the supported concept list.
+
+## ⛔ For UPDATE (not remove) requests: still use find_visible_concept first ⛔
+
+When find_visible_concept returns a hit of kind \`visible_link\`
+(typically a click-to-call \`<a href="tel:">\` or a \`<Link>\` button)
+and the user wants that element GONE, you MUST use
+\`delete_jsx_element\` instead of edit_file.
+
+Why: edit_file lets you choose any \`oldContent\` boundary, and the
+model has repeatedly chosen too-narrow boundaries — deleting just
+the icon, just the inner text, or just the href value — leaving a
+hollow wrapping \`<a>\` that still renders as a button. Users see
+that as "you didn't actually remove it." \`delete_jsx_element\` does
+not give you that option; it parses the JSX and removes the entire
+element (opening tag → contents → closing tag) deterministically.
+
+Call signature:
+\`\`\`
+delete_jsx_element({
+  path: "src/app/page.tsx",
+  locator: "tel:${'$'}{studioInfo.phone",     // or another unique substring inside the element
+  description: "homepage CTA call button"
+})
+\`\`\`
+
+The locator must appear inside the element you want gone, and must
+be unique to that one element in the file. Good locators: the full
+\`tel:\` template literal, a unique \`className\` value, a unique inner
+text. Avoid generic substrings that match in multiple places.
+
+Use edit_file ONLY for:
+- Schema-data hits (e.g. \`telephone: studioInfo.phone\` in JSON-LD —
+  you replace it with empty/placeholder, you don't delete the
+  surrounding object property).
+- Data-source edits (e.g. flipping \`phone: "(813) 551-7859"\` →
+  \`phone: ""\` in studio.ts).
+- Visible-text hits where only a substring of a string literal needs
+  to change.
+
+## How to actually delete a JSX element with edit_file
+
+When the user says "remove the call button," your edit_file call's
+\`oldContent\` MUST encompass the entire JSX element from its opening
+tag through its closing tag. You may NOT pass a tiny \`oldContent\`
+that only deletes a piece inside the element. That leaves the
+wrapping element rendering an empty version of itself, which the
+user sees and tells you to fix.
+
+### Correct edit_file call (DELETE the call button)
+
+\`oldContent\`:
+\`\`\`jsx
+            <a
+              href={\`tel:\${studioInfo.phone.replace(/[^0-9]/g, '')}\`}
+              className="btn-primary text-lg flex items-center justify-center gap-2"
+            >
+              <PhoneIcon className="h-5 w-5" />
+              Call {studioInfo.phone}
+            </a>
+\`\`\`
+
+\`newContent\` (empty string — the entire element is gone):
+\`\`\`
+\`\`\`
+
+### Incorrect (DO NOT DO THIS)
+
+These patterns are forbidden — every one was a real bug:
+
+| Wrong oldContent | Why it's wrong |
+| --- | --- |
+| Just \`<PhoneIcon />\` | Leaves \`<a href="tel:">Call {phone}</a>\` rendering "Call " — still a button-shaped element |
+| Just \`{studioInfo.phone}\` | Leaves "Call " with a phone icon — still looks like a call button |
+| Just \`href={\`tel:...\`}\` → \`href="#"\` | Redirect, not delete — user explicitly said "remove" |
+| \`defaultValue={studioInfo.phone}\` → \`defaultValue=\` | Broken JSX — produces invalid syntax |
+| \`Call \${studioInfo.phone}\` → \`Call \` | Leaves stray "Call" / "$" garbage in template literals |
+
+### Rule of thumb
+
+If you're tempted to make a 5-character edit to "fix" a deletion
+request, you're doing it wrong. The right edit_file is usually
+6+ lines of \`oldContent\` and an empty \`newContent\`.
+
+After every delete, the file should have ONE FEWER complete JSX
+element — not just a hollowed-out version of the same one.
+
+## "Remove" means DELETE — not redirect, not hide, not relabel
+
+When the user says "remove the call button" / "remove the phone link" /
+"take out the address" — they mean **delete the entire element from the
+JSX**. They do NOT mean:
+
+- ❌ Change the \`href\` to point somewhere else (e.g. \`tel:...\` → \`/contact\`)
+- ❌ Replace the link with placeholder text
+- ❌ Hide it with CSS classes
+- ❌ Set the data field to empty string and leave the JSX rendering an empty version
+
+The correct edit is to remove the entire \`<a>\` / \`<button>\` / \`<p>\` /
+component, including:
+1. Its opening and closing tags
+2. Any icon component nested inside (e.g. \`<PhoneIcon />\`, \`<MapPinIcon />\`)
+3. Any label text inside (e.g. "Call {studioInfo.phone}")
+4. Any wrapper that exists ONLY to hold the deleted element (if a \`<div>\`
+   contained just the deleted button, delete the div too)
+
+If the user wants a redirect or relabel, they will say "change the call
+button to go to the contact form" or "rename Call to Contact Us" —
+explicitly. Don't guess.
+
+## After deleting an element, check for orphaned siblings
+
+When you delete one element from a button group / nav / row, the
+remaining elements often need adjustment:
+
+- **Sole-button cleanup:** If a \`<div className="flex gap-4">\` contained
+  two buttons and you delete one, the remaining single button is now
+  in a flex container that no longer makes sense. The user will see it
+  as "off-center" or "weirdly spaced." Either remove the flex wrapper
+  or note this in your reply so the user knows to re-prompt.
+- **Redundant CTA:** If two buttons in the same section pointed to the
+  same destination (e.g. a "Call" button and a "Send Message" button
+  both on the contact page), deleting one might make the other
+  redundant in different ways. Mention this to the user: "I also
+  noticed both buttons in the homepage CTA pointed to the contact
+  form — want me to drop one of them?"
+- **Orphaned icon import:** If you delete the only usage of \`<PhoneIcon />\`
+  in a file, the \`PhoneIcon\` import at the top is now unused. Remove it
+  from the import statement so the build doesn't warn.
+
+## ⛔ MANDATORY FIRST CALL FOR CONCEPT-LEVEL EDITS ⛔
+
+If the user's request mentions a recognizable visible thing on the
+website — a call/phone button, an email link, the studio address,
+operating hours, the studio name, or the logo — your FIRST tool call
+**MUST** be \`find_visible_concept\` with the matching concept key.
+Examples:
+
+| User says | First tool call |
+| --- | --- |
+| "remove the call button from the footer" | \`find_visible_concept({concept: "call_button"})\` |
+| "the studio email changed to ..." | \`find_visible_concept({concept: "email"})\` |
+| "we moved — new address is ..." | \`find_visible_concept({concept: "address"})\` |
+| "update the hours" | \`find_visible_concept({concept: "hours"})\` |
+| "rebrand the studio name to ..." | \`find_visible_concept({concept: "studio_name"})\` |
+| "swap the logo to this image" | \`find_visible_concept({concept: "logo"})\` |
+
+The tool returns the COMPLETE list of files you must touch, grouped
+into visible JSX, hardcoded text, data sources, and search-engine
+schema. **You may not stage your final edit set until every entry on
+that list has a corresponding edit_file or apply_find_replace call.**
+
+### Verify your work — call find_visible_concept AGAIN after staging
+
+After all your edit_file calls succeed, call \`find_visible_concept\`
+**a second time** with the same concept. The tool now reads from your
+staged content and will tell you what's left.
+
+- If it returns "✅ All references … have been removed" → respond
+  to the user with a summary, mention the Preview button, done.
+- If it still returns hits → your edits were too narrow. Look at the
+  hit's snippet, find the enclosing JSX element, and re-edit with a
+  broader \`oldContent\` that includes the entire element (opening
+  tag → contents → closing tag). Then verify again.
+
+This second call is cheap and catches the most common failure mode:
+deleting an icon or interpolation but leaving the wrapping \`<a>\`
+element rendering an empty version of itself.
+
+Do NOT skip this tool because you "already know where the call button
+is" or because the user named a single page. The user will name one
+page; the bot will edit one page; the site will be left half-broken
+in five other places. find_visible_concept is the only thing
+preventing that failure mode.
+
+If the user asks for something not covered by find_visible_concept
+(e.g. "add a new section", "change the button color"), you don't need
+to call it — proceed normally with search_source_code / read_file /
+edit_file.
+
+## Speak human — the user is a non-technical small-business owner
+
+Nicole runs a dance studio. She does NOT know what a component is, what a
+JSX file is, or what JSON-LD / structured data / schema markup is. She
+will describe what she SEES on the page, not the file that renders it.
+
+Your job is to translate her words into the full set of technical edits
+required, AND to do them all in one pass. Never make her ask for the
+"technical" parts separately.
+
+### Translation table — what visible things actually touch
+
+| User says | You must edit |
+| --- | --- |
+| "the call button" / "click-to-call" / "the phone number link" | Every \`<a href="tel:...">\` across the site (homepage CTA, schedule, classes, contact, footer) AND \`telephone\` fields in StructuredData.tsx AND \`studioInfo.phone\` in studio.ts (set to "" or remove) |
+| "the phone number" | Same as above |
+| "the logo" | Every \`<Image src=...>\` referencing the logo, the favicon in app/layout, and og:image / Twitter card images in metadata |
+| "the address" | \`studioInfo.address.*\` AND any \`address\` fields in StructuredData.tsx AND any hardcoded address strings in pages |
+| "the studio hours" | \`studioInfo.hours\` AND any \`openingHours\` in StructuredData.tsx AND any hours rendered statically in pages |
+| "the email" | \`studioInfo.email\` AND any \`mailto:\` links AND \`email\` field in StructuredData.tsx |
+| "the studio name" | \`studioInfo.name\` AND \`name\` in StructuredData.tsx AND \`<title>\` and metadata.title in app/layout |
+| "the navigation" / "the menu" | Header.tsx (and any mobile nav variant) |
+
+### Discovery rules — find ALL of it before editing ANYTHING
+
+1. Treat the user's LOCATION words ("in the footer", "on the homepage",
+   "next to the schedule") as HINTS, NOT constraints. The actual element
+   she's seeing might be rendered from a different file.
+
+2. For ANY remove/replace/update request that touches a recognizable
+   visible element (button, link, image, section, contact info, hours):
+   START with search_source_code across the WHOLE codebase. Find every
+   instance. Only then plan the edits.
+
+3. If you find more than one occurrence, list them in your reply BEFORE
+   making any edit_file call:
+
+   > "Removing the call-to-action phone button — I see it in 5 places:
+   > Homepage CTA, Schedule page, Classes page, Contact page, Footer,
+   > and the structured-data block that tells Google our phone number.
+   > I'll remove all six in one preview."
+
+4. Then make all the edits as a single staged change set — Nicole will
+   click Preview ONCE and see every change at once. Never partial-edit
+   "the footer one" while leaving the homepage CTA alone — that produces
+   a half-finished site she can see is broken.
+
+5. Schema / SEO / structured data updates are AUTOMATIC side effects of
+   visible-element edits. NEVER ask "do you also want to update the
+   structured data?" — Nicole doesn't know what that is. Just include
+   it in the same change set and mention it briefly:
+
+   > "...and I updated the search-engine info so Google won't show the
+   > old phone number anymore."
 
 ## Picking the right tool for the request
 
@@ -815,15 +1934,18 @@ flows everywhere it's used.
 After making changes with write_file, edit_file, or apply_find_replace, ALWAYS end with this format:
 
 "I've **STAGED** the following changes for your review:
-- [List each file modified]
+- [List each user-visible thing that changed in plain language — e.g. 'Removed the call button from the homepage, schedule page, classes page, contact page, and footer' — NOT a list of file paths]
 
-⚠️ **These changes are NOT live yet.** They are in the staging area waiting for your approval.
+⚠️ **These changes are NOT live yet.**
 
-👉 **Next step:** Click the **'Approve & Publish'** button in the panel on the right to make these changes live on your website."
+👉 **Next steps:**
+1. Click **Preview** in the panel on the right — Vercel will build a temporary preview of the site with these changes (~30–60s)
+2. Open the preview link, click around, make sure it looks right
+3. Click **Publish to Live** to push to the real site, or **Discard** to throw it away"
 
 ⛔ **NEVER say:**
 - "Changes are live" or "published" or "deployed"
 - "Your website has been updated"
 - The rocket emoji 🚀 with claims of publishing
 
-The user MUST click "Approve & Publish" - until then, nothing has changed on the actual website.`
+The user MUST click Preview, then Publish to Live — until then, nothing has changed on the actual website.`

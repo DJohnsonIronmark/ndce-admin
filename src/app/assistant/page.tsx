@@ -118,6 +118,17 @@ Just tell me what you'd like to do, or upload some content to get started!`,
   const [isProcessingTask, setIsProcessingTask] = useState(false)
   const [previewExpanded, setPreviewExpanded] = useState(true)
   const [editingChangeId, setEditingChangeId] = useState<string | null>(null)
+  // Preview workflow state. When previewBranch is set, the staged changes
+  // have been committed to a staging branch and Vercel is building a
+  // preview deployment. Until the user clicks Publish to Live or Discard,
+  // production is untouched.
+  const [previewBranch, setPreviewBranch] = useState<string | null>(null)
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null)
+  const [isCreatingPreview, setIsCreatingPreview] = useState(false)
+  const [isPublishingLive, setIsPublishingLive] = useState(false)
+  // Live label for what the assistant is doing right now (set from SSE
+  // tool_start events). Falls back to "Thinking..." between tool calls.
+  const [currentActivity, setCurrentActivity] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
@@ -165,10 +176,12 @@ Just tell me what you'd like to do, or upload some content to get started!`,
         .filter(a => a.uploadStatus === 'uploaded' && a.uploadedPath)
         .map(a => ({ type: a.type, name: a.name, uploadedPath: a.uploadedPath }))
 
-      // Call agentic AI assistant with tool capabilities
+      // Call agentic AI assistant with tool capabilities. The route now
+      // streams SSE events (tool_start, tool_end, final, error) so we can
+      // render live progress instead of a static "Thinking..." indicator.
       const response = await fetch('/api/assistant', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
         body: JSON.stringify({
           message: input,
           history: getConversationHistory(),
@@ -176,10 +189,88 @@ Just tell me what you'd like to do, or upload some content to get started!`,
         }),
       })
 
-      const result = await response.json()
+      if (!response.ok || !response.body) {
+        // Surface non-2xx responses as a normal error message and bail
+        // out of the streaming path.
+        const text = await response.text().catch(() => '')
+        throw new Error(text || `Assistant request failed: ${response.status}`)
+      }
+
+      // SSE reader. Each event is `data: <json>\n\n`. We only care about
+      // the typed payloads our route emits; anything else is ignored.
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buf = ''
+      type StagedChangeFromServer = {
+        id: string
+        type: 'find_replace' | 'website_update' | 'social_post'
+        title: string
+        description: string
+        findText?: string
+        replaceText?: string
+        matchCount?: number
+        filesAffected?: number
+        stagingId?: string
+        section?: string
+        content?: string
+        platforms?: string[]
+        caption?: string
+        files?: Array<{ path: string; newContent: string; sha: string }>
+      }
+      type AssistantFinal = {
+        success?: boolean
+        response?: string
+        toolsUsed?: Array<{ name: string; input: unknown }>
+        turns?: number
+        taskList?: TaskItem[] | null
+        stagedChanges?: StagedChangeFromServer[] | null
+        error?: string
+        details?: string
+      }
+      let result: AssistantFinal | null = null
+      let streamError: string | null = null
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+
+        // Events are separated by a blank line; pop the trailing partial.
+        const parts = buf.split('\n\n')
+        buf = parts.pop() ?? ''
+
+        for (const part of parts) {
+          if (!part.startsWith('data:')) continue
+          const json = part.slice(part.indexOf(':') + 1).trim()
+          if (!json) continue
+          try {
+            const evt = JSON.parse(json) as Record<string, unknown>
+            if (evt.type === 'tool_start') {
+              const label = typeof evt.label === 'string' ? evt.label : (typeof evt.name === 'string' ? evt.name : 'Working')
+              setCurrentActivity(label)
+            } else if (evt.type === 'tool_end') {
+              setCurrentActivity(null)
+            } else if (evt.type === 'final') {
+              result = evt as AssistantFinal
+            } else if (evt.type === 'error') {
+              streamError = (evt.details as string) || (evt.error as string) || 'Unknown error'
+            }
+          } catch {
+            // Malformed event — skip.
+          }
+        }
+      }
+
+      if (streamError) {
+        throw new Error(streamError)
+      }
+
+      setCurrentActivity(null)
 
       // Handle agentic response
-      if (result.success && result.response) {
+      if (result && result.success && result.response) {
+        const responseText = result.response
+        const stagedFromServer = result.stagedChanges ?? []
         // Clear progress
         setProgressSteps([])
 
@@ -198,7 +289,7 @@ Just tell me what you'd like to do, or upload some content to get started!`,
         setMessages(prev => [...prev, {
           id: Date.now().toString(),
           role: 'assistant',
-          content: result.response,
+          content: responseText,
           timestamp: new Date(),
         }])
 
@@ -208,10 +299,10 @@ Just tell me what you'd like to do, or upload some content to get started!`,
         }
 
         // Handle staged changes from assistant tools
-        if (result.stagedChanges && result.stagedChanges.length > 0) {
+        if (stagedFromServer.length > 0) {
           setStagedChanges(prev => [
             ...prev,
-            ...result.stagedChanges.map((sc: {
+            ...stagedFromServer.map((sc: {
               id: string
               type: 'find_replace' | 'website_update' | 'social_post'
               title: string
@@ -475,6 +566,7 @@ Just tell me what you'd like to do, or upload some content to get started!`,
       setMessages(prev => [...prev, aiResponse])
     }
 
+    setCurrentActivity(null)
     setIsLoading(false)
   }
 
@@ -1181,116 +1273,147 @@ Just tell me what you'd like to do, or upload some content to get started!`,
     }))
   }
 
-  // Publish staged changes
-  const handlePublish = async () => {
+  // Flatten staged changes into a list of files to commit. Used by both
+  // the preview workflow (commits to a staging branch) and is the single
+  // place that translates UI staging objects into GitHub commits.
+  const collectFilesForCommit = (): Array<{ path: string; newContent: string; sha?: string }> => {
+    const files: Array<{ path: string; newContent: string; sha?: string }> = []
+    for (const change of stagedChanges) {
+      if (change.type === 'find_replace' && change.files) {
+        const finalReplaceText = change.editedReplaceText ?? change.replaceText
+        let filesToAdd = change.files
+        // If the user edited the replacement text after staging, re-apply
+        // find/replace on the staged file contents so we commit the right thing.
+        if (
+          change.editedReplaceText !== undefined &&
+          change.editedReplaceText !== change.replaceText &&
+          change.findText
+        ) {
+          const findRegex = new RegExp(
+            change.findText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+            'gi',
+          )
+          filesToAdd = change.files.map(f => ({
+            ...f,
+            newContent: f.newContent.replace(findRegex, finalReplaceText ?? ''),
+          }))
+        }
+        for (const f of filesToAdd) {
+          files.push({ path: f.path, newContent: f.newContent, sha: f.sha })
+        }
+      } else if (change.type === 'website_update' && change.section && change.content) {
+        // section holds the file path for write_file/edit_file changes.
+        const finalContent = change.editedContent ?? change.content
+        files.push({ path: change.section, newContent: finalContent })
+      }
+      // social_post is intentionally not committed to the site repo.
+    }
+    return files
+  }
+
+  // STEP 1: Build a Vercel preview deployment from staged changes.
+  // This commits the bundle to a fresh staging-<id> branch — production
+  // is untouched until the user clicks Publish to Live.
+  const handlePreview = async () => {
     if (stagedChanges.length === 0) return
 
+    const files = collectFilesForCommit()
+    if (files.length === 0) {
+      setMessages(prev => [...prev, {
+        id: Date.now().toString(),
+        role: 'assistant',
+        content: `⚠️ Nothing to preview. The staged changes don't include any file edits yet.`,
+        timestamp: new Date(),
+      }])
+      return
+    }
+
+    setIsCreatingPreview(true)
     setIsPublishing(true)
     setProgressSteps([
       { ...UPDATE_STEPS.COMMITTING, status: 'active' },
       { ...UPDATE_STEPS.PUSHING, status: 'pending' },
       { ...UPDATE_STEPS.DEPLOYING, status: 'pending' },
+    ])
+
+    try {
+      const commitMessage = `Staging: ${stagedChanges.length} change${stagedChanges.length === 1 ? '' : 's'} via assistant`
+      const response = await fetch('/api/website/preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ files, commitMessage }),
+      })
+      const result = await response.json()
+
+      if (result.success) {
+        updateProgress('committing', 'complete', `Committed ${result.filesCommitted} file(s)`)
+        updateProgress('pushing', 'complete', `Pushed to ${result.branch}`)
+        updateProgress('deploying', 'active', 'Vercel building preview...')
+
+        setPreviewBranch(result.branch)
+        setPreviewUrl(result.previewUrl)
+
+        setMessages(prev => [...prev, {
+          id: Date.now().toString(),
+          role: 'assistant',
+          content: `🧪 **Preview ready to build**\n\nI've committed ${result.filesCommitted} file(s) to a staging branch (\`${result.branch}\`). Vercel is building the preview now (usually 30–60 seconds).\n\n**Preview URL:** ${result.previewUrl}\n\nOpen it in a new tab to review. Once you're happy, click **Publish to Live**. To throw away these changes without publishing, click **Discard**.`,
+          timestamp: new Date(),
+        }])
+      } else {
+        updateProgress('committing', 'error', result.error || 'Preview failed')
+        setMessages(prev => [...prev, {
+          id: Date.now().toString(),
+          role: 'assistant',
+          content: `❌ **Preview failed**\n\n${result.error || result.message || 'Unknown error'}`,
+          timestamp: new Date(),
+        }])
+      }
+    } catch (error) {
+      console.error('Preview error:', error)
+      updateProgress('committing', 'error', 'Failed to build preview')
+      setMessages(prev => [...prev, {
+        id: Date.now().toString(),
+        role: 'assistant',
+        content: `❌ **Preview failed**\n\n${error instanceof Error ? error.message : 'Unknown error'}`,
+        timestamp: new Date(),
+      }])
+    } finally {
+      setIsCreatingPreview(false)
+      setIsPublishing(false)
+      setTimeout(() => setProgressSteps([]), 3000)
+    }
+  }
+
+  // STEP 2: Promote the staging branch to main once the user has reviewed
+  // the preview. Vercel auto-deploys main to production.
+  const handlePublishLive = async () => {
+    if (!previewBranch) return
+
+    setIsPublishingLive(true)
+    setIsPublishing(true)
+    setProgressSteps([
+      { ...UPDATE_STEPS.PUSHING, status: 'active', label: 'Merging to main...' },
+      { ...UPDATE_STEPS.DEPLOYING, status: 'pending' },
       { ...UPDATE_STEPS.COMPLETE, status: 'pending' },
     ])
 
     try {
-      // Publish each staged change based on type
-      let allSuccess = true
-      let totalFilesUpdated = 0
-      const publishedItems: string[] = []
+      const commitMessage = `Publish ${stagedChanges.length} change${stagedChanges.length === 1 ? '' : 's'} via assistant`
+      const response = await fetch('/api/website/promote', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ branch: previewBranch, commitMessage }),
+      })
+      const result = await response.json()
 
-      for (const change of stagedChanges) {
-        if (change.type === 'find_replace') {
-          // Publish find-replace via GitHub.
-          // If the user edited the replacement text, re-apply find/replace to the
-          // staged file contents on the client so we publish the right thing.
-          const finalReplaceText = change.editedReplaceText ?? change.replaceText
-          const commitMessage = `Replace "${change.findText}" with "${finalReplaceText}" (${change.matchCount} occurrences)`
-
-          let filesToPublish = change.files
-          if (
-            filesToPublish &&
-            change.editedReplaceText !== undefined &&
-            change.editedReplaceText !== change.replaceText &&
-            change.findText
-          ) {
-            const findRegex = new RegExp(
-              change.findText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
-              'gi',
-            )
-            filesToPublish = filesToPublish.map(f => ({
-              ...f,
-              newContent: f.newContent.replace(findRegex, finalReplaceText ?? ''),
-            }))
-          }
-
-          const response = await fetch('/api/website/publish', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              action: 'publish',
-              stagingId: change.stagingId,
-              commitMessage,
-              // Send prepared file contents so publish does not depend on
-              // the in-memory staging store (which is lost across serverless invocations).
-              files: filesToPublish,
-            }),
-          })
-
-          const result = await response.json()
-          if (!result.success) {
-            allSuccess = false
-            break
-          }
-          totalFilesUpdated += result.filesUpdated || change.filesAffected || 0
-          publishedItems.push(`Find & Replace: "${change.findText}" → "${finalReplaceText}"`)
-        } else if (change.type === 'website_update') {
-          // Publish file operation via GitHub
-          // Send content directly to bypass in-memory staging (which doesn't work in serverless)
-          const commitMessage = change.description || `File update: ${change.section || 'website content'}`
-          const finalContent = change.editedContent ?? change.content
-
-          const response = await fetch('/api/website/publish', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              action: 'publish',
-              stagingId: change.stagingId,
-              commitMessage,
-              path: change.section,  // section contains the file path
-              content: finalContent,  // send content directly
-            }),
-          })
-
-          const result = await response.json()
-          if (!result.success) {
-            allSuccess = false
-            console.error('Failed to publish website update:', result.message)
-            break
-          }
-          totalFilesUpdated += result.filesUpdated || 1
-          publishedItems.push(`Website Update: ${change.section || change.description || 'file update'}`)
-        } else if (change.type === 'social_post') {
-          // Social posts - for now, just log success (would integrate with social API)
-          const finalCaption = change.editedCaption ?? change.caption
-          publishedItems.push(`Social Post: ${change.platforms?.join(', ') || 'social media'}`)
-          // TODO: Integrate with social media scheduling API
-          console.log('Publishing social post:', { platforms: change.platforms, caption: finalCaption })
-        }
-      }
-
-      updateProgress('committing', 'complete', 'Changes committed')
-      updateProgress('pushing', 'active')
-
-      if (allSuccess) {
-        updateProgress('pushing', 'complete', 'Pushed to GitHub')
-        updateProgress('deploying', 'active')
-
-        await new Promise(r => setTimeout(r, 1000))
-        updateProgress('deploying', 'complete', 'Vercel deploying...')
+      if (result.success) {
+        updateProgress('pushing', 'complete', 'Merged to main')
+        updateProgress('deploying', 'active', 'Vercel deploying to production...')
+        await new Promise(r => setTimeout(r, 600))
+        updateProgress('deploying', 'complete', 'Production deploy started')
         updateProgress('complete', 'complete', 'All updates published!')
 
-        // Update all staged suggestions to applied
+        // Mark all staged suggestions as applied.
         stagedChanges.forEach(change => {
           setMessages(prev => prev.map(msg => {
             if (msg.id === change.messageId && msg.suggestions) {
@@ -1307,29 +1430,36 @@ Just tell me what you'd like to do, or upload some content to get started!`,
           }))
         })
 
-        // Clear staged changes
         setStagedChanges([])
+        setPreviewBranch(null)
+        setPreviewUrl(null)
 
-        // Add success message
         setMessages(prev => [...prev, {
           id: Date.now().toString(),
           role: 'assistant',
-          content: `🚀 **Published successfully!**\n\nYour changes are now being deployed to:\nhttps://ndce-platform.vercel.app\n\nDeployment typically takes 30-60 seconds.`,
+          content: `🚀 **Published live!**\n\nYour changes are now deploying to production:\nhttps://ndce-site-v2.vercel.app\n\nDeployment typically takes 30–60 seconds.`,
           timestamp: new Date(),
         }])
       } else {
-        throw new Error('Some changes failed to publish')
+        updateProgress('pushing', 'error', result.error || 'Publish failed')
+        setMessages(prev => [...prev, {
+          id: Date.now().toString(),
+          role: 'assistant',
+          content: `❌ **Publish to Live failed**\n\n${result.error || result.message || 'Unknown error'}\n\nThe staging branch \`${previewBranch}\` is still in place — try again, or click Discard to throw it away.`,
+          timestamp: new Date(),
+        }])
       }
     } catch (error) {
-      console.error('Publish error:', error)
-      updateProgress('pushing', 'error', 'Failed to publish')
+      console.error('Promote error:', error)
+      updateProgress('pushing', 'error', 'Failed to merge')
       setMessages(prev => [...prev, {
         id: Date.now().toString(),
         role: 'assistant',
-        content: `❌ **Publish failed**\n\n${error instanceof Error ? error.message : 'Unknown error'}`,
+        content: `❌ **Publish to Live failed**\n\n${error instanceof Error ? error.message : 'Unknown error'}`,
         timestamp: new Date(),
       }])
     } finally {
+      setIsPublishingLive(false)
       setIsPublishing(false)
       setTimeout(() => setProgressSteps([]), 3000)
     }
@@ -1416,12 +1546,28 @@ Just tell me what you'd like to do, or upload some content to get started!`,
     }
   }
 
-  // Reject/rollback staged changes
+  // Reject/rollback staged changes. If a preview branch is in flight,
+  // also delete it on GitHub so we don't leave orphaned staging branches.
   const handleReject = async () => {
-    if (stagedChanges.length === 0) return
+    if (stagedChanges.length === 0 && !previewBranch) return
 
     setIsLoading(true)
     try {
+      // If we already pushed a preview to GitHub, discard that branch first.
+      if (previewBranch) {
+        try {
+          await fetch('/api/website/discard', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ branch: previewBranch }),
+          })
+        } catch (e) {
+          console.warn('Failed to delete staging branch on discard:', e)
+        }
+        setPreviewBranch(null)
+        setPreviewUrl(null)
+      }
+
       const response = await fetch('/api/website/publish', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1601,7 +1747,9 @@ Just tell me what you'd like to do, or upload some content to get started!`,
                     <Eye className="h-5 w-5 text-amber-600" />
                     <div className="text-left">
                       <p className="font-medium text-amber-800">
-                        {stagedChanges.length} change{stagedChanges.length > 1 ? 's' : ''} awaiting approval
+                        {previewBranch
+                          ? `Preview ready — review before publishing`
+                          : `${stagedChanges.length} change${stagedChanges.length > 1 ? 's' : ''} awaiting preview`}
                       </p>
                       <p className="text-sm text-amber-600">
                         {previewExpanded ? 'Click to collapse preview' : 'Click to expand preview'}
@@ -1609,28 +1757,78 @@ Just tell me what you'd like to do, or upload some content to get started!`,
                     </div>
                   </button>
                   <div className="flex gap-2">
-                    <button
-                      onClick={handleReject}
-                      disabled={isPublishing}
-                      className="flex items-center gap-1 rounded-lg border border-red-300 bg-white px-4 py-2 text-sm font-medium text-red-700 hover:bg-red-50 disabled:opacity-50"
-                    >
-                      <XCircle className="h-4 w-4" />
-                      Reject
-                    </button>
-                    <button
-                      onClick={handlePublish}
-                      disabled={isPublishing || editingChangeId !== null}
-                      className="flex items-center gap-1 rounded-lg bg-green-600 px-4 py-2 text-sm font-medium text-white hover:bg-green-700 disabled:opacity-50"
-                    >
-                      {isPublishing ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                      ) : (
-                        <Rocket className="h-4 w-4" />
-                      )}
-                      Approve & Publish
-                    </button>
+                    {previewBranch ? (
+                      <>
+                        <button
+                          onClick={handleReject}
+                          disabled={isPublishing || isPublishingLive}
+                          className="flex items-center gap-1 rounded-lg border border-red-300 bg-white px-4 py-2 text-sm font-medium text-red-700 hover:bg-red-50 disabled:opacity-50"
+                        >
+                          <XCircle className="h-4 w-4" />
+                          Discard
+                        </button>
+                        <button
+                          onClick={handlePublishLive}
+                          disabled={isPublishing || isPublishingLive || editingChangeId !== null}
+                          className="flex items-center gap-1 rounded-lg bg-green-600 px-4 py-2 text-sm font-medium text-white hover:bg-green-700 disabled:opacity-50"
+                        >
+                          {isPublishingLive ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Rocket className="h-4 w-4" />
+                          )}
+                          Publish to Live
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <button
+                          onClick={handleReject}
+                          disabled={isPublishing}
+                          className="flex items-center gap-1 rounded-lg border border-red-300 bg-white px-4 py-2 text-sm font-medium text-red-700 hover:bg-red-50 disabled:opacity-50"
+                        >
+                          <XCircle className="h-4 w-4" />
+                          Reject
+                        </button>
+                        <button
+                          onClick={handlePreview}
+                          disabled={isPublishing || isCreatingPreview || editingChangeId !== null}
+                          className="flex items-center gap-1 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+                        >
+                          {isCreatingPreview ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Eye className="h-4 w-4" />
+                          )}
+                          Preview
+                        </button>
+                      </>
+                    )}
                   </div>
                 </div>
+
+                {/* Preview URL banner — visible once the staging branch is built */}
+                {previewBranch && previewUrl && (
+                  <div className="px-6 py-3 bg-blue-50 border-b border-blue-200 flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <Eye className="h-4 w-4 text-blue-600 shrink-0" />
+                      <div>
+                        <p className="text-sm font-medium text-blue-800">Preview deployment</p>
+                        <p className="text-xs text-blue-700">
+                          Branch <code className="px-1 bg-blue-100 rounded">{previewBranch}</code> · production unchanged until you click Publish to Live
+                        </p>
+                      </div>
+                    </div>
+                    <a
+                      href={previewUrl}
+                      target="_blank"
+                      rel="noreferrer noopener"
+                      className="text-sm font-medium text-blue-700 hover:text-blue-900 underline whitespace-nowrap"
+                    >
+                      Open preview →
+                    </a>
+                  </div>
+                )}
 
                 {/* Expanded Preview Content */}
                 {previewExpanded && (
@@ -2069,7 +2267,7 @@ Just tell me what you'd like to do, or upload some content to get started!`,
                 <div className="flex justify-start">
                   <div className="flex items-center gap-2 rounded-lg bg-white px-4 py-3 shadow">
                     <Loader2 className="h-4 w-4 animate-spin text-purple-600" />
-                    <span className="text-sm text-gray-600">Thinking...</span>
+                    <span className="text-sm text-gray-600">{currentActivity ?? 'Thinking...'}</span>
                   </div>
                 </div>
               )}

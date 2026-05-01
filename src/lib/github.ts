@@ -122,12 +122,14 @@ export async function searchInFiles(searchText: string, caseSensitive: boolean =
   return matches
 }
 
-// Update a single file
+// Update a single file. Default branch is `main`; pass a staging branch
+// name to commit there instead (used by the preview workflow).
 export async function updateFile(
   path: string,
   newContent: string,
   sha: string,
-  message: string
+  message: string,
+  branch: string = DEFAULT_BRANCH,
 ): Promise<UpdateResult> {
   try {
     const response = await githubFetch(`/repos/${REPO_OWNER}/${REPO_NAME}/contents/${path}`, {
@@ -139,7 +141,7 @@ export async function updateFile(
         message,
         content: Buffer.from(newContent).toString('base64'),
         sha,
-        branch: DEFAULT_BRANCH,
+        branch,
       }),
     })
 
@@ -152,6 +154,86 @@ export async function updateFile(
     return { success: true, path, sha: data.content.sha }
   } catch (error) {
     return { success: false, path, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+}
+
+// Get the SHA of a file on a specific branch (or null if it doesn't exist
+// there yet). Avoids the base64-decode work in getFileContent — we only
+// need the SHA for the next PUT.
+export async function getFileShaOnBranch(path: string, branch: string): Promise<string | null> {
+  const response = await githubFetch(`/repos/${REPO_OWNER}/${REPO_NAME}/contents/${path}?ref=${encodeURIComponent(branch)}`)
+  if (!response.ok) return null
+  const data = await response.json().catch(() => null)
+  return data?.sha ?? null
+}
+
+// Create a new branch pointing at main's current HEAD. Idempotent: if the
+// branch already exists, returns success.
+export async function createBranchFromMain(branchName: string): Promise<{ success: boolean; sha?: string; error?: string }> {
+  try {
+    const headResp = await githubFetch(`/repos/${REPO_OWNER}/${REPO_NAME}/git/refs/heads/${DEFAULT_BRANCH}`)
+    if (!headResp.ok) {
+      return { success: false, error: `Could not read ${DEFAULT_BRANCH} HEAD (${headResp.status})` }
+    }
+    const headData = await headResp.json()
+    const sha = headData.object?.sha
+    if (!sha) return { success: false, error: 'main HEAD has no commit sha' }
+
+    const createResp = await githubFetch(`/repos/${REPO_OWNER}/${REPO_NAME}/git/refs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ref: `refs/heads/${branchName}`, sha }),
+    })
+    if (createResp.status === 201) return { success: true, sha }
+    if (createResp.status === 422) {
+      // Already exists — that's fine for our purposes.
+      return { success: true, sha }
+    }
+    const errBody = await createResp.json().catch(() => ({}))
+    return { success: false, error: errBody.message || `HTTP ${createResp.status}` }
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+}
+
+// Merge a branch into main. Returns the new main HEAD sha on success.
+export async function mergeBranchToMain(branchName: string, commitMessage?: string): Promise<{ success: boolean; sha?: string; error?: string }> {
+  try {
+    const resp = await githubFetch(`/repos/${REPO_OWNER}/${REPO_NAME}/merges`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        base: DEFAULT_BRANCH,
+        head: branchName,
+        commit_message: commitMessage || `Merge ${branchName} into ${DEFAULT_BRANCH} (assistant publish)`,
+      }),
+    })
+    if (resp.status === 201) {
+      const data = await resp.json()
+      return { success: true, sha: data.sha }
+    }
+    if (resp.status === 204) {
+      // Already up-to-date; nothing to merge.
+      return { success: true }
+    }
+    const errBody = await resp.json().catch(() => ({}))
+    return { success: false, error: errBody.message || `HTTP ${resp.status}` }
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+}
+
+// Delete a branch ref.
+export async function deleteBranch(branchName: string): Promise<{ success: boolean; error?: string }> {
+  try {
+    const resp = await githubFetch(`/repos/${REPO_OWNER}/${REPO_NAME}/git/refs/heads/${branchName}`, {
+      method: 'DELETE',
+    })
+    if (resp.status === 204 || resp.status === 422) return { success: true }
+    const errBody = await resp.json().catch(() => ({}))
+    return { success: false, error: errBody.message || `HTTP ${resp.status}` }
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
   }
 }
 

@@ -4,6 +4,7 @@ import { promisify } from 'util'
 import { access } from 'fs/promises'
 import { commitStagedChanges, updateFile, getFileContent } from '@/lib/github'
 import { getStagedChanges, getAllPendingChanges, updateStagedStatus, removeStagedChanges, getGenericStagedChange, updateGenericStagedStatus, removeGenericStagedChange } from '@/lib/github-staging'
+import { requireSessionOrServiceToken } from '@/lib/session'
 
 const execAsync = promisify(exec)
 
@@ -35,6 +36,11 @@ async function isLocalAvailable(): Promise<boolean> {
 }
 
 export async function POST(request: NextRequest) {
+  const auth = await requireSessionOrServiceToken(request)
+  if (!auth.ok) {
+    return NextResponse.json({ error: 'Authentication required' }, { status: 401 })
+  }
+
   try {
     const body: PublishRequest = await request.json()
     const { action, commitMessage, stagingId, path, content, sha, files } = body
@@ -388,7 +394,12 @@ export async function POST(request: NextRequest) {
 }
 
 // GET endpoint to check staged changes status
-export async function GET() {
+export async function GET(request: NextRequest) {
+  const auth = await requireSessionOrServiceToken(request)
+  if (!auth.ok) {
+    return NextResponse.json({ error: 'Authentication required' }, { status: 401 })
+  }
+
   // Check if we're in local mode
   const localAvailable = await isLocalAvailable()
 

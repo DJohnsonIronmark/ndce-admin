@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { addStagedChange } from '@/lib/github-staging'
+import { requireSessionOrServiceToken } from '@/lib/session'
 
 interface FileOperationRequest {
   operation: 'write' | 'edit' | 'delete'
@@ -12,6 +13,11 @@ interface FileOperationRequest {
 }
 
 export async function POST(request: NextRequest) {
+  const auth = await requireSessionOrServiceToken(request)
+  if (!auth.ok) {
+    return NextResponse.json({ error: 'Authentication required' }, { status: 401 })
+  }
+
   try {
     const body: FileOperationRequest = await request.json()
     const { operation, path, content, sha, description, oldContent, newContent } = body
