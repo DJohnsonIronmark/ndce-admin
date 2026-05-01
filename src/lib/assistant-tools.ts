@@ -146,8 +146,9 @@ async function findVisibleConcept(input: string): Promise<string> {
   }
 
   const { def } = resolved
-  // Run all searches in parallel for speed.
-  const searchResults = await Promise.all(
+
+  // Run all searches against main in parallel for speed.
+  const mainSearchResults = await Promise.all(
     def.searches.map(async (s) => {
       try {
         const matches = await searchInFiles(s.pattern, false)
@@ -164,22 +165,61 @@ async function findVisibleConcept(input: string): Promise<string> {
     }),
   )
 
-  // Flatten + dedupe (file:line keys). Skip backup folders — those are stale
-  // copies that the platform repo keeps for safety; editing them would do
-  // nothing on the live site and would confuse the bot.
-  const seen = new Set<string>()
-  const hits: AggregatedHit[] = []
-  for (const group of searchResults) {
-    for (const hit of group) {
-      if (hit.file.startsWith('backups/')) continue
-      const key = `${hit.file}:${hit.line}`
-      if (seen.has(key)) continue
-      seen.add(key)
-      hits.push(hit)
+  // Also search the staged copies the bot has produced so far in this
+  // session. If the bot already deleted a reference via edit_file, the
+  // hit on main is no longer accurate — we want the post-edit view so
+  // the bot can verify its own work, not a stale snapshot.
+  const stagedFiles = new Map<string, string>()
+  for (const change of getAllGenericPendingChanges()) {
+    if (change.path && change.content) stagedFiles.set(change.path, change.content)
+  }
+
+  const stagedSearchHits: AggregatedHit[] = []
+  for (const [path, content] of stagedFiles) {
+    const lines = content.split('\n')
+    for (const s of def.searches) {
+      const needle = s.pattern.toLowerCase()
+      lines.forEach((line, idx) => {
+        if (line.toLowerCase().includes(needle)) {
+          stagedSearchHits.push({
+            file: path,
+            line: idx + 1,
+            snippet: line.trim().substring(0, 140),
+            kind: s.kind,
+            why: s.why + ' (in staged content)',
+          })
+        }
+      })
     }
   }
 
+  // Merge: for any file that has staged content, drop the main hits for
+  // that file and use the staged hits. Files without staged edits keep
+  // their main hits.
+  const merged: AggregatedHit[] = []
+  for (const group of mainSearchResults) {
+    for (const hit of group) {
+      if (stagedFiles.has(hit.file)) continue
+      merged.push(hit)
+    }
+  }
+  merged.push(...stagedSearchHits)
+
+  // Dedupe (file:line keys), skip backup folders.
+  const seen = new Set<string>()
+  const hits: AggregatedHit[] = []
+  for (const hit of merged) {
+    if (hit.file.startsWith('backups/')) continue
+    const key = `${hit.file}:${hit.line}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    hits.push(hit)
+  }
+
   if (hits.length === 0) {
+    if (stagedFiles.size > 0) {
+      return `✅ All references for "${def.display}" have been removed in your staged edits. You're ready to finish — respond to the user with a summary of what changed and tell them to click Preview.`
+    }
     return `No references found for "${def.display}". Either the concept is already removed or the user is describing something else. Ask them to clarify with a screenshot or specific page name.`
   }
 
@@ -968,6 +1008,53 @@ Concrete rules:
   keep searching. Tell the user "I couldn't locate that — can you
   point me at the file or paste a screenshot?" and stop.
 
+## How to actually delete a JSX element with edit_file
+
+When the user says "remove the call button," your edit_file call's
+\`oldContent\` MUST encompass the entire JSX element from its opening
+tag through its closing tag. You may NOT pass a tiny \`oldContent\`
+that only deletes a piece inside the element. That leaves the
+wrapping element rendering an empty version of itself, which the
+user sees and tells you to fix.
+
+### Correct edit_file call (DELETE the call button)
+
+\`oldContent\`:
+\`\`\`jsx
+            <a
+              href={\`tel:\${studioInfo.phone.replace(/[^0-9]/g, '')}\`}
+              className="btn-primary text-lg flex items-center justify-center gap-2"
+            >
+              <PhoneIcon className="h-5 w-5" />
+              Call {studioInfo.phone}
+            </a>
+\`\`\`
+
+\`newContent\` (empty string — the entire element is gone):
+\`\`\`
+\`\`\`
+
+### Incorrect (DO NOT DO THIS)
+
+These patterns are forbidden — every one was a real bug:
+
+| Wrong oldContent | Why it's wrong |
+| --- | --- |
+| Just \`<PhoneIcon />\` | Leaves \`<a href="tel:">Call {phone}</a>\` rendering "Call " — still a button-shaped element |
+| Just \`{studioInfo.phone}\` | Leaves "Call " with a phone icon — still looks like a call button |
+| Just \`href={\`tel:...\`}\` → \`href="#"\` | Redirect, not delete — user explicitly said "remove" |
+| \`defaultValue={studioInfo.phone}\` → \`defaultValue=\` | Broken JSX — produces invalid syntax |
+| \`Call \${studioInfo.phone}\` → \`Call \` | Leaves stray "Call" / "$" garbage in template literals |
+
+### Rule of thumb
+
+If you're tempted to make a 5-character edit to "fix" a deletion
+request, you're doing it wrong. The right edit_file is usually
+6+ lines of \`oldContent\` and an empty \`newContent\`.
+
+After every delete, the file should have ONE FEWER complete JSX
+element — not just a hollowed-out version of the same one.
+
 ## "Remove" means DELETE — not redirect, not hide, not relabel
 
 When the user says "remove the call button" / "remove the phone link" /
@@ -1032,6 +1119,23 @@ The tool returns the COMPLETE list of files you must touch, grouped
 into visible JSX, hardcoded text, data sources, and search-engine
 schema. **You may not stage your final edit set until every entry on
 that list has a corresponding edit_file or apply_find_replace call.**
+
+### Verify your work — call find_visible_concept AGAIN after staging
+
+After all your edit_file calls succeed, call \`find_visible_concept\`
+**a second time** with the same concept. The tool now reads from your
+staged content and will tell you what's left.
+
+- If it returns "✅ All references … have been removed" → respond
+  to the user with a summary, mention the Preview button, done.
+- If it still returns hits → your edits were too narrow. Look at the
+  hit's snippet, find the enclosing JSX element, and re-edit with a
+  broader \`oldContent\` that includes the entire element (opening
+  tag → contents → closing tag). Then verify again.
+
+This second call is cheap and catches the most common failure mode:
+deleting an icon or interpolation but leaving the wrapping \`<a>\`
+element rendering an empty version of itself.
 
 Do NOT skip this tool because you "already know where the call button
 is" or because the user named a single page. The user will name one
