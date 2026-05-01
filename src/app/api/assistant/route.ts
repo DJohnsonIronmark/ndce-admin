@@ -331,6 +331,33 @@ export async function POST(request: NextRequest) {
                 })
               }
 
+              // Generic handler for tools that stage one OR MORE files via the
+              // <staging_payload> tag (delete_jsx_element, remove_concept).
+              // Each file in payload.files becomes its own panel entry so the
+              // user sees every changed file.
+              if (
+                (toolUse.name === 'delete_jsx_element' || toolUse.name === 'remove_concept') &&
+                payload?.files &&
+                payload.files.length > 0
+              ) {
+                const input = toolUse.input as { description?: string; concept?: string; path?: string }
+                const baseDescription =
+                  toolUse.name === 'remove_concept'
+                    ? `Removed ${input.concept ? input.concept.replace(/_/g, ' ') : 'concept'}`
+                    : input.description || `Deleted element in ${input.path}`
+                for (const file of payload.files) {
+                  stagedChanges.push({
+                    id: `staged-${Date.now()}-${stagedChanges.length}`,
+                    type: 'website_update',
+                    title: toolUse.name === 'remove_concept' ? 'Concept Removal' : 'Element Deletion',
+                    description: `${baseDescription} — ${file.path}`,
+                    section: file.path,
+                    content: file.newContent,
+                    stagingId: '',
+                  })
+                }
+              }
+
               toolResults.push({
                 name: toolUse.name,
                 input: toolUse.input,
