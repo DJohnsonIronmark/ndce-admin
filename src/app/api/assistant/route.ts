@@ -116,6 +116,10 @@ function toolLabel(name: string, input: unknown): string {
       return typeof i.concept === 'string'
         ? `Finding every "${i.concept}" reference`
         : 'Finding all references'
+    case 'delete_jsx_element': {
+      const p = typeof i.path === 'string' ? i.path.split('/').pop() : undefined
+      return p ? `Deleting element in ${p}` : 'Deleting element'
+    }
     default:
       return name
   }

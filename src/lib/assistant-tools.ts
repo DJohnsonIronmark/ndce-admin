@@ -121,6 +121,69 @@ const CONCEPTS: Record<string, ConceptDef> = {
   },
 }
 
+// Find the JSX element (opening tag through closing tag) that contains
+// `hitLine` (1-indexed). We try each common element type in order; the
+// first one whose tags actually balance around the hit line wins.
+//
+// This is intentionally heuristic, not a full JSX parser. It handles
+// the cases the bot keeps stumbling on (deleting <a>/<button>/<Link>/<p>
+// elements that wrap call buttons, phone text, etc.) where a real
+// parser would be overkill.
+function findEnclosingJsxRange(
+  content: string,
+  hitLine: number,
+): { startLine: number; endLine: number; tag: string } | null {
+  const lines = content.split('\n')
+  for (const tag of ['a', 'button', 'Link', 'div', 'p', 'span']) {
+    const range = findRangeForTag(lines, hitLine - 1, tag)
+    if (range) return { ...range, tag }
+  }
+  return null
+}
+
+function findRangeForTag(
+  lines: string[],
+  hitLine0: number,
+  tag: string,
+): { startLine: number; endLine: number } | null {
+  // Match `<tag ` or `<tag>` (NOT `<tagx`). Self-closing `<tag />` is
+  // intentionally counted as both open and close — for our use case
+  // self-closing wrappers don't enclose anything anyway.
+  const openRe = new RegExp(`<${tag}(\\s|>)`, 'g')
+  const selfCloseRe = new RegExp(`<${tag}[^>]*\\/>`, 'g')
+  const closeRe = new RegExp(`</${tag}>`, 'g')
+
+  // Walk forward from start of file, maintaining a stack of unmatched
+  // opens. The top of stack at hitLine0 is the enclosing element.
+  const stack: number[] = []
+  for (let i = 0; i <= hitLine0; i++) {
+    const line = lines[i]
+    const opens = (line.match(openRe) || []).length
+    const selfCloses = (line.match(selfCloseRe) || []).length
+    const closes = (line.match(closeRe) || []).length
+    // self-closes already counted as opens by openRe; subtract them.
+    const realOpens = opens - selfCloses
+    for (let o = 0; o < realOpens; o++) stack.push(i)
+    for (let c = 0; c < closes; c++) stack.pop()
+  }
+  if (stack.length === 0) return null
+
+  const startLine0 = stack[stack.length - 1]
+  // Walk forward from after hitLine to find the matching close.
+  let depth = stack.length
+  for (let i = hitLine0 + 1; i < lines.length; i++) {
+    const line = lines[i]
+    const opens = (line.match(openRe) || []).length
+    const selfCloses = (line.match(selfCloseRe) || []).length
+    const closes = (line.match(closeRe) || []).length
+    depth += (opens - selfCloses) - closes
+    if (depth < stack.length) {
+      return { startLine: startLine0 + 1, endLine: i + 1 }
+    }
+  }
+  return null
+}
+
 function resolveConcept(input: string): { key: string; def: ConceptDef } | null {
   const norm = input.toLowerCase().replace(/[\s\-]+/g, '_')
   if (CONCEPTS[norm]) return { key: norm, def: CONCEPTS[norm] }
@@ -340,6 +403,28 @@ export const ASSISTANT_TOOLS: Anthropic.Tool[] = [
         },
       },
       required: ['searchText'],
+    },
+  },
+  {
+    name: 'delete_jsx_element',
+    description: 'PREFERRED tool for "remove this clickable element" requests (call buttons, links, etc.). Finds the enclosing JSX element around a unique locator string and DELETES the entire element from opening tag through closing tag in one shot. Use this instead of edit_file whenever the user asks to delete a button/link/element — edit_file lets you make subtle micro-edits that leave a hollow wrapper rendering an empty button. This tool does not give you that option; it deletes the whole thing or fails clean.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        path: {
+          type: 'string',
+          description: 'File path relative to the repo root, e.g. "src/app/page.tsx".',
+        },
+        locator: {
+          type: 'string',
+          description: 'A unique substring that appears INSIDE the element you want to delete. Good locators: a tel: href, a specific className combination, a unique inner text. Must be unique enough to match exactly one element.',
+        },
+        description: {
+          type: 'string',
+          description: 'A short human-readable note about what is being deleted, e.g. "homepage CTA call button".',
+        },
+      },
+      required: ['path', 'locator', 'description'],
     },
   },
   {
@@ -635,6 +720,102 @@ export async function executeTool(
           return `Error: "concept" parameter is required. Supported concepts: ${Object.keys(CONCEPTS).join(', ')}.`
         }
         return await findVisibleConcept(concept)
+      }
+
+      case 'delete_jsx_element': {
+        if (!isGitHubAvailable()) {
+          return 'Error: GitHub integration is not configured.'
+        }
+        const { path, locator, description } = toolInput as {
+          path: string
+          locator: string
+          description: string
+        }
+        if (!path || !locator) {
+          return 'Error: both "path" and "locator" are required.'
+        }
+        try {
+          // Get latest content — staged version takes precedence so multiple
+          // delete calls on the same file compose correctly.
+          const stagedContent = getStagedFileContent(path)
+          let content: string
+          let sha: string
+          if (stagedContent !== null) {
+            content = stagedContent
+            try {
+              const fresh = await getFileContent(path)
+              sha = fresh.sha
+            } catch {
+              sha = ''
+            }
+          } else {
+            const fresh = await getFileContent(path)
+            content = fresh.content
+            sha = fresh.sha
+          }
+
+          // Find unique locator line.
+          const lines = content.split('\n')
+          const matches: number[] = []
+          for (let i = 0; i < lines.length; i++) {
+            if (lines[i].includes(locator)) matches.push(i)
+          }
+          if (matches.length === 0) {
+            return `Error: locator "${locator}" not found in ${path}. The file may already have been edited. Call read_file to see current content.`
+          }
+          if (matches.length > 1) {
+            return `Error: locator "${locator}" matched ${matches.length} lines in ${path}. The locator must be unique to one element. Lines: ${matches.map(m => m + 1).join(', ')}. Try a more specific substring (e.g. include surrounding className or attribute values).`
+          }
+          const hitLine = matches[0] + 1 // 1-indexed for findEnclosingJsxRange
+
+          const range = findEnclosingJsxRange(content, hitLine)
+          if (!range) {
+            return `Error: could not find an enclosing JSX element around "${locator}" in ${path}. The locator may not be inside an <a>/<button>/<Link>/<p>/<div>/<span>. Use edit_file with explicit oldContent instead.`
+          }
+
+          // Compute deleted span (for confirmation) and new content.
+          const deletedSnippet = lines.slice(range.startLine - 1, range.endLine).join('\n')
+          const before = lines.slice(0, range.startLine - 1)
+          const after = lines.slice(range.endLine)
+          const newContent = [...before, ...after].join('\n')
+
+          // Stage via /api/website/file-operation.
+          const response = await fetch(`${baseUrl}/api/website/file-operation`, {
+            method: 'POST',
+            headers: buildServiceHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify({
+              operation: 'edit',
+              path,
+              content: newContent,
+              sha,
+              description: description || `Delete <${range.tag}> element in ${path}`,
+            }),
+          })
+          const data = await response.json()
+          if (!data.success) {
+            return `Failed to stage delete: ${data.message || 'Unknown error'}`
+          }
+
+          const summary = [
+            `✅ Deleted <${range.tag}> element from ${path} (lines ${range.startLine}–${range.endLine}) - STAGED (NOT LIVE)`,
+            ``,
+            `**Deleted:**`,
+            '```jsx',
+            deletedSnippet,
+            '```',
+            ``,
+            `**Description:** ${description || '(none)'}`,
+            `**Staging ID:** ${data.stagingId || 'N/A'}`,
+            ``,
+            `⚠️ This change is in staging only. After staging all your deletes, call find_visible_concept to verify nothing was missed, then tell the user to click Preview.`,
+          ].join('\n')
+
+          // Embed staging payload so the route can publish directly without
+          // depending on the in-memory staging store across cold starts.
+          return `${summary}\n\n<staging_payload>${JSON.stringify({ files: [{ path, newContent, sha }] })}</staging_payload>`
+        } catch (error) {
+          return `Error deleting element from "${path}": ${error instanceof Error ? error.message : 'Unknown error'}`
+        }
       }
 
       case 'get_staged_changes': {
@@ -1007,6 +1188,44 @@ Concrete rules:
 - If you can't find what the user described after 2 searches, do not
   keep searching. Tell the user "I couldn't locate that — can you
   point me at the file or paste a screenshot?" and stop.
+
+## ⛔ MANDATORY for "remove this element" requests: use delete_jsx_element ⛔
+
+When find_visible_concept returns a hit of kind \`visible_link\`
+(typically a click-to-call \`<a href="tel:">\` or a \`<Link>\` button)
+and the user wants that element GONE, you MUST use
+\`delete_jsx_element\` instead of edit_file.
+
+Why: edit_file lets you choose any \`oldContent\` boundary, and the
+model has repeatedly chosen too-narrow boundaries — deleting just
+the icon, just the inner text, or just the href value — leaving a
+hollow wrapping \`<a>\` that still renders as a button. Users see
+that as "you didn't actually remove it." \`delete_jsx_element\` does
+not give you that option; it parses the JSX and removes the entire
+element (opening tag → contents → closing tag) deterministically.
+
+Call signature:
+\`\`\`
+delete_jsx_element({
+  path: "src/app/page.tsx",
+  locator: "tel:${'$'}{studioInfo.phone",     // or another unique substring inside the element
+  description: "homepage CTA call button"
+})
+\`\`\`
+
+The locator must appear inside the element you want gone, and must
+be unique to that one element in the file. Good locators: the full
+\`tel:\` template literal, a unique \`className\` value, a unique inner
+text. Avoid generic substrings that match in multiple places.
+
+Use edit_file ONLY for:
+- Schema-data hits (e.g. \`telephone: studioInfo.phone\` in JSON-LD —
+  you replace it with empty/placeholder, you don't delete the
+  surrounding object property).
+- Data-source edits (e.g. flipping \`phone: "(813) 551-7859"\` →
+  \`phone: ""\` in studio.ts).
+- Visible-text hits where only a substring of a string literal needs
+  to change.
 
 ## How to actually delete a JSX element with edit_file
 
