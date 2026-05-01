@@ -120,6 +120,10 @@ function toolLabel(name: string, input: unknown): string {
       const p = typeof i.path === 'string' ? i.path.split('/').pop() : undefined
       return p ? `Deleting element in ${p}` : 'Deleting element'
     }
+    case 'remove_concept':
+      return typeof i.concept === 'string'
+        ? `Removing every ${String(i.concept).replace(/_/g, ' ')} from the site`
+        : 'Removing concept'
     default:
       return name
   }

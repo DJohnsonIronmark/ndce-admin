@@ -53,10 +53,20 @@ interface ConceptSearch {
   why: string
 }
 
+interface DataDefinition {
+  file: string                // data file path, e.g. 'src/lib/data/studio.ts'
+  key: string                 // top-level key to clear, e.g. 'phone'
+}
+
 interface ConceptDef {
   display: string             // human-readable name shown to user
   aliases: string[]           // alternate keys the bot might pass
   searches: ConceptSearch[]
+  // When the user says "remove this concept entirely," ALSO clear these
+  // values in their data-file source of truth. Without this, JSX deletions
+  // succeed but the underlying `phone: "(813)..."` stays in studio.ts as
+  // dead data. Only used by remove_concept, not find_visible_concept.
+  dataDefinitions?: DataDefinition[]
 }
 
 // Each concept lists the literal substrings to grep for and what each match
@@ -71,6 +81,9 @@ const CONCEPTS: Record<string, ConceptDef> = {
       { pattern: 'tel:', kind: 'visible_link', why: 'Renders a click-to-call link in the page' },
       { pattern: 'studioInfo.phone', kind: 'data_source', why: 'References the studio phone number' },
       { pattern: 'telephone:', kind: 'schema_data', why: 'Schema field that tells Google the phone number' },
+    ],
+    dataDefinitions: [
+      { file: 'src/lib/data/studio.ts', key: 'phone' },
     ],
   },
   email: {
@@ -429,6 +442,247 @@ async function findVisibleConcept(input: string): Promise<string> {
   ].join('\n')
 }
 
+// ============================================================================
+// remove_concept — deterministic deletion across the entire codebase.
+//
+// The model has been unreliable at picking edit boundaries. This tool takes
+// the LLM out of the deletion step entirely: given a concept name, it walks
+// the same registry, finds every hit across visible JSX / schema / data, and
+// applies the appropriate deletion strategy per kind:
+//   - visible_link / visible_text → delete enclosing JSX element
+//   - schema_data → strip the matched line
+//   - data_source DEFINITIONS (in dataDefinitions[]) → clear the value
+//   - data_source REFERENCES → ignored here (handled by JSX deletion above)
+//
+// Returns a single summary; stages all edits in one batch.
+// ============================================================================
+
+interface RemoveConceptFileResult {
+  path: string
+  sha: string
+  finalContent: string
+  jsxRangesDeleted: Array<{ startLine: number; endLine: number; tag: string }>
+  schemaLinesStripped: number[]
+  dataFieldsCleared: string[]
+}
+
+async function removeConcept(input: string, baseUrl: string, requestNote?: string): Promise<string> {
+  const resolved = resolveConcept(input)
+  if (!resolved) {
+    const known = Object.keys(CONCEPTS).join(', ')
+    return `Unknown concept "${input}" for remove_concept. Known concepts: ${known}.`
+  }
+  const { def } = resolved
+
+  // Step 1: discover every hit. We search main, then overlay any session-staged
+  // versions of files so multiple remove_concept calls in one session compose.
+  type FileEntry = { content: string; sha: string }
+  const fileEntries = new Map<string, FileEntry>()
+
+  const loadFile = async (path: string): Promise<FileEntry | null> => {
+    if (fileEntries.has(path)) return fileEntries.get(path)!
+    const staged = getStagedFileContent(path)
+    if (staged !== null) {
+      let sha = ''
+      try { sha = (await getFileContent(path)).sha } catch {}
+      const entry = { content: staged, sha }
+      fileEntries.set(path, entry)
+      return entry
+    }
+    try {
+      const fresh = await getFileContent(path)
+      const entry = { content: fresh.content, sha: fresh.sha }
+      fileEntries.set(path, entry)
+      return entry
+    } catch {
+      return null
+    }
+  }
+
+  // Track which (pattern, kind) tuples to apply per file
+  const targetsByFile = new Map<string, Array<ConceptSearch>>()
+
+  await Promise.all(def.searches.map(async (s) => {
+    try {
+      const matches = await searchInFiles(s.pattern, false)
+      for (const m of matches) {
+        if (m.path.startsWith('backups/')) continue
+        const entry = await loadFile(m.path)
+        if (!entry) continue
+        const arr = targetsByFile.get(m.path) || []
+        if (!arr.some(x => x.pattern === s.pattern && x.kind === s.kind)) arr.push(s)
+        targetsByFile.set(m.path, arr)
+      }
+    } catch {
+      // skip — search failure on one pattern shouldn't kill the whole op
+    }
+  }))
+
+  // Also include data definition files even if they didn't show up in searches
+  // (they may not match any pattern but still need their value cleared).
+  if (def.dataDefinitions) {
+    for (const dd of def.dataDefinitions) {
+      await loadFile(dd.file)
+    }
+  }
+
+  // Step 2: apply deletions per file. Operations are computed in two passes so
+  // that JSX-element deletions don't shift line numbers under schema-line
+  // strips. We collect line indices to remove, then splice in reverse order.
+  const fileResults: RemoveConceptFileResult[] = []
+
+  for (const [path, entry] of fileEntries) {
+    const targets = targetsByFile.get(path) || []
+    const fileLines = entry.content.split('\n')
+
+    const linesToDelete = new Set<number>()         // 0-indexed
+    const jsxDeleted: Array<{ startLine: number; endLine: number; tag: string }> = []
+    const schemaStripped: number[] = []
+    const dataFieldsCleared: string[] = []
+
+    // For each target pattern, find every matching line in the CURRENT lines
+    // and queue a deletion of the appropriate scope.
+    for (const t of targets) {
+      const idxs: number[] = []
+      for (let i = 0; i < fileLines.length; i++) {
+        if (fileLines[i].includes(t.pattern)) idxs.push(i)
+      }
+      for (const idx of idxs) {
+        if (linesToDelete.has(idx)) continue // already queued
+        if (t.kind === 'visible_link' || t.kind === 'visible_text') {
+          const range = findEnclosingJsxRange(fileLines.join('\n'), idx + 1)
+          if (range) {
+            for (let i = range.startLine - 1; i <= range.endLine - 1; i++) linesToDelete.add(i)
+            jsxDeleted.push({ ...range })
+          } else {
+            linesToDelete.add(idx)
+          }
+        } else if (t.kind === 'schema_data') {
+          linesToDelete.add(idx)
+          schemaStripped.push(idx + 1)
+        }
+        // data_source references are intentionally NOT auto-deleted here.
+        // They live inside JSX that's already being deleted (call buttons),
+        // or inside data files which are handled separately below.
+      }
+    }
+
+    // Data-definition handling: for each (file, key) in dataDefinitions whose
+    // file matches THIS path, find the line `<key>: "<value>"` (or single-quote)
+    // and clear the value. If we can't find a clean match, skip — better to
+    // leave dead data than to corrupt the file.
+    if (def.dataDefinitions) {
+      for (const dd of def.dataDefinitions) {
+        if (dd.file !== path) continue
+        for (let i = 0; i < fileLines.length; i++) {
+          if (linesToDelete.has(i)) continue
+          const m = fileLines[i].match(
+            new RegExp(`^(\\s*)(${dd.key})(\\s*:\\s*)(['\"])([^'\"]*)\\4(\\s*,?\\s*)$`)
+          )
+          if (m) {
+            fileLines[i] = `${m[1]}${m[2]}${m[3]}${m[4]}${m[4]}${m[6]}`
+            dataFieldsCleared.push(dd.key)
+            break
+          }
+        }
+      }
+    }
+
+    if (linesToDelete.size === 0 && dataFieldsCleared.length === 0) {
+      continue
+    }
+
+    // Apply line deletions highest-first to keep indices stable
+    if (linesToDelete.size > 0) {
+      const sorted = [...linesToDelete].sort((a, b) => b - a)
+      for (const idx of sorted) fileLines.splice(idx, 1)
+    }
+
+    fileResults.push({
+      path,
+      sha: entry.sha,
+      finalContent: fileLines.join('\n'),
+      jsxRangesDeleted: jsxDeleted,
+      schemaLinesStripped: schemaStripped,
+      dataFieldsCleared,
+    })
+  }
+
+  if (fileResults.length === 0) {
+    return `No matching code found for "${def.display}". Either the concept is already removed or the user is describing something else.`
+  }
+
+  // Step 3: stage every changed file via /api/website/file-operation, and
+  // build a single staging_payload so the publish path can commit directly.
+  const stagingPayload: Array<{ path: string; newContent: string; sha: string }> = []
+  const stagingErrors: string[] = []
+
+  for (const fr of fileResults) {
+    try {
+      const response = await fetch(`${baseUrl}/api/website/file-operation`, {
+        method: 'POST',
+        headers: buildServiceHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          operation: 'edit',
+          path: fr.path,
+          content: fr.finalContent,
+          sha: fr.sha,
+          description: `remove_concept: ${def.display}${requestNote ? ` (${requestNote})` : ''}`,
+        }),
+      })
+      const data = await response.json()
+      if (!data.success) {
+        stagingErrors.push(`${fr.path}: ${data.message || 'unknown error'}`)
+        continue
+      }
+      stagingPayload.push({ path: fr.path, newContent: fr.finalContent, sha: fr.sha })
+    } catch (err) {
+      stagingErrors.push(`${fr.path}: ${err instanceof Error ? err.message : 'fetch failed'}`)
+    }
+  }
+
+  // Step 4: build human-readable summary
+  const totalJsxDeleted = fileResults.reduce((n, fr) => n + fr.jsxRangesDeleted.length, 0)
+  const totalSchemaStripped = fileResults.reduce((n, fr) => n + fr.schemaLinesStripped.length, 0)
+  const totalDataCleared = fileResults.reduce((n, fr) => n + fr.dataFieldsCleared.length, 0)
+
+  const lines: string[] = [
+    `✅ **Removed ${def.display}** — STAGED (NOT LIVE)`,
+    ``,
+    `**Summary:**`,
+    `- Deleted ${totalJsxDeleted} JSX element(s) from ${fileResults.filter(fr => fr.jsxRangesDeleted.length > 0).length} file(s)`,
+    `- Stripped ${totalSchemaStripped} schema line(s)`,
+    `- Cleared ${totalDataCleared} data field(s)`,
+    `- Files modified: ${stagingPayload.length}`,
+    ``,
+    `**Per-file:**`,
+  ]
+  for (const fr of fileResults) {
+    const bits: string[] = []
+    if (fr.jsxRangesDeleted.length > 0) {
+      bits.push(`deleted ${fr.jsxRangesDeleted.length} <${fr.jsxRangesDeleted.map(r => r.tag).join('>/<')}> element(s)`)
+    }
+    if (fr.schemaLinesStripped.length > 0) {
+      bits.push(`stripped ${fr.schemaLinesStripped.length} schema line(s)`)
+    }
+    if (fr.dataFieldsCleared.length > 0) {
+      bits.push(`cleared ${fr.dataFieldsCleared.join(', ')}`)
+    }
+    lines.push(`- **${fr.path}** — ${bits.join('; ')}`)
+  }
+  if (stagingErrors.length > 0) {
+    lines.push(``, `⚠️ Errors:`)
+    for (const e of stagingErrors) lines.push(`- ${e}`)
+  }
+  lines.push(
+    ``,
+    `📋 Tell the user: "I removed every reference to the ${def.display}. Click Preview to see the staging deployment, then Publish to Live."`,
+  )
+
+  const summary = lines.join('\n')
+  return `${summary}\n\n<staging_payload>${JSON.stringify({ files: stagingPayload })}</staging_payload>`
+}
+
 export const ASSISTANT_TOOLS: Anthropic.Tool[] = [
   {
     name: 'review_website',
@@ -526,8 +780,26 @@ export const ASSISTANT_TOOLS: Anthropic.Tool[] = [
     },
   },
   {
+    name: 'remove_concept',
+    description: 'PREFERRED tool for "remove X" / "delete X" / "we no longer have X" requests where X is a known concept (call_button, email, address, hours, studio_name, logo). Does the entire deletion deterministically with NO LLM choices: walks every visible JSX hit and deletes the wrapping element, strips matching schema lines, and clears matching values in data files. ONE tool call replaces 5+ edit_file calls and eliminates the hollow-wrapper bug class. Use this FIRST for any removal request — only fall back to delete_jsx_element / edit_file if the concept isn\'t in the supported list.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        concept: {
+          type: 'string',
+          description: 'A canonical concept name. Supported: call_button, phone_number, email, address, hours, studio_name, logo. Synonyms accepted: phone, click_to_call, mailto, location, operating_hours, business_name, brand_logo.',
+        },
+        request_note: {
+          type: 'string',
+          description: 'Optional short note about why the user is removing this — gets baked into the commit message. e.g. "studio no longer has a phone line".',
+        },
+      },
+      required: ['concept'],
+    },
+  },
+  {
     name: 'find_visible_concept',
-    description: 'REQUIRED before any "remove X" or "update X" request that targets a recognizable visible element of the website (call button, phone number, email link, address, hours, studio name, logo). Returns the COMPLETE list of code locations you must edit to fully satisfy the request — across visible JSX, hardcoded text, data sources, and search-engine schema. Use this instead of guessing or relying on the user\'s location words. After calling this, you must edit every entry in the result.',
+    description: 'Use this when the user wants to UPDATE a concept (not remove it) — returns the COMPLETE list of code locations you must edit. For REMOVE requests, prefer remove_concept which does the work in one shot. Supported concepts: call_button, email, address, hours, studio_name, logo.',
     input_schema: {
       type: 'object' as const,
       properties: {
@@ -818,6 +1090,17 @@ export async function executeTool(
           return `Error: "concept" parameter is required. Supported concepts: ${Object.keys(CONCEPTS).join(', ')}.`
         }
         return await findVisibleConcept(concept)
+      }
+
+      case 'remove_concept': {
+        if (!isGitHubAvailable()) {
+          return 'Error: GitHub integration is not configured.'
+        }
+        const { concept, request_note } = toolInput as { concept: string; request_note?: string }
+        if (!concept) {
+          return `Error: "concept" parameter is required. Supported concepts: ${Object.keys(CONCEPTS).join(', ')}.`
+        }
+        return await removeConcept(concept, baseUrl, request_note)
       }
 
       case 'delete_jsx_element': {
@@ -1297,7 +1580,42 @@ Concrete rules:
   keep searching. Tell the user "I couldn't locate that — can you
   point me at the file or paste a screenshot?" and stop.
 
-## ⛔ MANDATORY for "remove this element" requests: use delete_jsx_element ⛔
+## ⛔⛔ TOP RULE FOR "REMOVE X" REQUESTS — use remove_concept ⛔⛔
+
+When the user says "remove the call buttons," "we no longer have a phone,"
+"delete the email link," "take down the address," etc., and the thing
+they're removing matches a known concept (call_button, email, address,
+hours, studio_name, logo) — the FIRST and ONLY tool you should call is
+\`remove_concept\`.
+
+\`\`\`
+remove_concept({
+  concept: "call_button",
+  request_note: "studio no longer has a phone line"
+})
+\`\`\`
+
+That single call:
+- Searches the entire codebase for every variant (tel: links, schema fields, data file values)
+- Deletes the wrapping JSX element for visible buttons
+- Strips matching schema lines from JSON-LD
+- Clears the value in the data file (e.g. \`phone: ""\`)
+- Stages all the edits in one batch
+
+DO NOT manually call find_visible_concept + delete_jsx_element + edit_file
+for known concepts. \`remove_concept\` does the whole job in one shot with
+ZERO LLM judgment in the deletion step. You cannot leave a hollow wrapper
+or miss a file because the tool handles that for you.
+
+After remove_concept returns, your job is done. Tell the user what the
+summary said and direct them to click Preview. Do NOT make additional
+edits "just to be safe" — duplicating work will collide with what
+remove_concept already staged.
+
+Only fall through to find_visible_concept / delete_jsx_element / edit_file
+if the user is asking about something OUTSIDE the supported concept list.
+
+## ⛔ For UPDATE (not remove) requests: still use find_visible_concept first ⛔
 
 When find_visible_concept returns a hit of kind \`visible_link\`
 (typically a click-to-call \`<a href="tel:">\` or a \`<Link>\` button)
