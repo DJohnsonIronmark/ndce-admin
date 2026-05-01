@@ -184,6 +184,104 @@ function findRangeForTag(
   return null
 }
 
+// Refuse edit_file calls that look like attempts to micro-edit a JSX element
+// instead of deleting it cleanly with delete_jsx_element. The bot has
+// repeatedly produced "hollow wrapper" diffs (icon-only delete, inner-text
+// delete, href neutered to "#") that leave a still-rendering button.
+//
+// Returns a refusal string to send back as the tool result, or null if the
+// edit should proceed.
+export function detectHollowJsxEdit(
+  path: string,
+  oldContent: string,
+  newContent: string,
+): string | null {
+  // We only police .tsx / .jsx files. Schema-data and config files (.ts, .js,
+  // .json) often legitimately contain `tel:` or `phone` strings that should
+  // be edited rather than deleted as JSX elements.
+  if (!path.endsWith('.tsx') && !path.endsWith('.jsx')) return null
+
+  const oldHasTel = /\btel:/.test(oldContent)
+  const oldHasMailto = /\bmailto:/.test(oldContent)
+  const oldHasPhoneIcon = /<PhoneIcon\b/.test(oldContent)
+  const oldHasJsxOpen = /<[A-Za-z][^>]*>/.test(oldContent)
+  const newIsEmpty = newContent.trim() === ''
+  const newHasMatchingClose = /<\/[A-Za-z]/.test(newContent)
+  const oldHasMatchingClose = /<\/[A-Za-z]/.test(oldContent)
+
+  // Pattern 1: oldContent contains a tel:/mailto: link or PhoneIcon, but
+  // newContent is non-empty AND doesn't contain the same tokens —
+  // the model is keeping the wrapper and trimming the contents.
+  if (
+    (oldHasTel || oldHasMailto || oldHasPhoneIcon) &&
+    !newIsEmpty &&
+    !/\btel:|\bmailto:|<PhoneIcon\b/.test(newContent)
+  ) {
+    return [
+      `❌ edit_file refused on ${path}.`,
+      ``,
+      `This looks like a partial deletion of a JSX element: oldContent contains`,
+      `\`tel:\`, \`mailto:\`, or \`<PhoneIcon>\`, and newContent strips it but`,
+      `keeps surrounding JSX. That leaves a hollow wrapper still rendering as a`,
+      `button on the page — exactly the bug we keep seeing.`,
+      ``,
+      `Use \`delete_jsx_element\` instead. Pick a unique substring inside the`,
+      `element (the full \`tel:\${...}\` template, a unique className, or a`,
+      `unique inner text), and the tool will delete the whole element from`,
+      `opening tag through closing tag.`,
+      ``,
+      `Example:`,
+      `delete_jsx_element({`,
+      `  path: "${path}",`,
+      `  locator: "tel:\${studioInfo.phone",`,
+      `  description: "remove call button"`,
+      `})`,
+    ].join('\n')
+  }
+
+  // Pattern 2: oldContent has a JSX opening tag with a matching close, and
+  // newContent has no closing tag — likely a broken-JSX edit (e.g.
+  // `defaultValue={...}` → `defaultValue=`).
+  if (oldHasJsxOpen && oldHasMatchingClose && !newIsEmpty && !newHasMatchingClose) {
+    // Heuristic check: did the model leave a dangling attribute (`attr=` with
+    // no value) or unmatched braces?
+    const dangling = /=\s*$/m.test(newContent) || /\{[^}]*$/.test(newContent)
+    if (dangling) {
+      return [
+        `❌ edit_file refused on ${path}.`,
+        ``,
+        `newContent looks like broken JSX — there's a dangling attribute`,
+        `assignment or unmatched brace. This produces invalid syntax and`,
+        `breaks the build.`,
+        ``,
+        `If you're trying to delete an element, use \`delete_jsx_element\`.`,
+        `If you're trying to remove a single attribute, edit the entire`,
+        `opening tag — don't leave \`attr=\` with no value.`,
+      ].join('\n')
+    }
+  }
+
+  // Pattern 3: oldContent is a tight slice of a `Call ${...}` template literal
+  // that the model is trying to neuter. Easy tell: oldContent contains the
+  // word "Call" inside a template literal context but doesn't include the
+  // surrounding JSX element.
+  const oldHasCallText = /\bCall\s+\{|\bCall\s+\$\{/.test(oldContent)
+  if (oldHasCallText && !oldHasMatchingClose && !newIsEmpty) {
+    return [
+      `❌ edit_file refused on ${path}.`,
+      ``,
+      `This edit only modifies the inner text "Call {phone}" but leaves the`,
+      `wrapping JSX element intact — the result still renders a button.`,
+      ``,
+      `Use \`delete_jsx_element\` with a locator inside the call button (e.g.`,
+      `the \`tel:\` template literal or the element's className) to delete the`,
+      `whole element at once.`,
+    ].join('\n')
+  }
+
+  return null
+}
+
 function resolveConcept(input: string): { key: string; def: ConceptDef } | null {
   const norm = input.toLowerCase().replace(/[\s\-]+/g, '_')
   if (CONCEPTS[norm]) return { key: norm, def: CONCEPTS[norm] }
@@ -981,6 +1079,16 @@ export async function executeTool(
           newContent: string
           description: string
         }
+
+        // Guard: refuse JSX-element micro-edits that leave a hollow wrapper.
+        // The model has repeatedly tried to "delete" a call button by stripping
+        // the icon, the inner text, or the href value — leaving the surrounding
+        // <a>/<button> still rendering as a button. Force it onto delete_jsx_element.
+        const refusal = detectHollowJsxEdit(path, oldContent, newContent)
+        if (refusal) {
+          return refusal
+        }
+
         try {
           // If a prior tool call already staged an edit to this file in the same
           // session, build on top of that staged content. Otherwise pull fresh
