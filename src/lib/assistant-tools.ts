@@ -79,6 +79,7 @@ const CONCEPTS: Record<string, ConceptDef> = {
     aliases: ['phone_number', 'phone', 'call_link', 'click_to_call', 'tel'],
     searches: [
       { pattern: 'tel:', kind: 'visible_link', why: 'Renders a click-to-call link in the page' },
+      { pattern: '<PhoneIcon', kind: 'visible_link', why: 'Phone icon that visually identifies a phone block' },
       { pattern: 'studioInfo.phone', kind: 'data_source', why: 'References the studio phone number' },
       { pattern: 'telephone:', kind: 'schema_data', why: 'Schema field that tells Google the phone number' },
     ],
